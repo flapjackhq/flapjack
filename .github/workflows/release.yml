@@ -229,8 +229,8 @@ jobs:
           predecessors_file="$scratch_dir/predecessors.tsv"
           trap 'rm -rf "$scratch_dir"' EXIT
 
-          # The helper validates canonical source equality and emits only the
-          # exact releaseTag/manifestSha256/binarySha256/rollbackMode records.
+          # The helper validates canonical source equality and emits exact
+          # releaseTag/manifestSha256/binarySha256 plus four recipe coordinates.
           package/release_artifact_manifest \
             --compatibility-predecessors "$candidate_manifest" \
             >"$predecessors_file"
@@ -259,7 +259,7 @@ jobs:
             echo "No in-place predecessor is claimed for ${target} by this release."
           fi
 
-          while IFS=$'\t' read -r release_tag manifest_sha binary_sha rollback_mode; do
+          while IFS=$'\t' read -r release_tag manifest_sha binary_sha _transition_mode _forward_transfer_mode rollback_mode _parity_profile; do
             [ -n "$release_tag" ] || continue
             old_dir="$scratch_dir/old-${release_tag}"
             mkdir -p "$old_dir/extracted"

@@ -19,9 +19,22 @@
 # RUSTSEC-2026-0253 is separately bounded to Tantivy's sole
 # LruCache<usize, Block>: the advisory requires a key with a panicking Drop,
 # which usize cannot provide. Remove it when Tantivy permits lru >=0.18.2.
+# 2026-11-17 maintenance dispositions (paired with ../deny.toml):
+# chrono is reachable in core/HTTP/SSL, including key/certificate expiry and
+# analytics; chrono-tz reaches Arrow/DataFusion date/time operations; humantime
+# reaches object_store duration configuration parsing. These three notices are
+# informational unmaintained reports with no patched versions. The assessed
+# Arrow 60.1.0, DataFusion 55.3.0 and object_store 0.14.2 releases still require
+# this graph, so changing direct chrono calls alone cannot remove it.
+# Migration/review: private Bead flapjack-56f, review by 2026-12-17. REMOVE the
+# exact IDs in both configs when a maintained compatible graph is validated or
+# the notices are withdrawn; preserve expiry, parsing and analytics behavior.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute names
     "RUSTSEC-2026-0195", # quick-xml: NsReader unbounded namespace allocation
     "RUSTSEC-2026-0253", # 2026-08-12: Tantivy's usize-keyed cache cannot trigger lru's panicking-Drop precondition
+    "RUSTSEC-2026-0542", # humantime: reachable object_store duration parser; maintenance migration in flapjack-56f
+    "RUSTSEC-2026-0543", # chrono: reachable runtime expiry/date operations; maintenance migration in flapjack-56f
+    "RUSTSEC-2026-0555", # chrono-tz: reachable Arrow/DataFusion date/time operations; maintenance migration in flapjack-56f
 ]
