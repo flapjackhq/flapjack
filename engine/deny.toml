@@ -16,10 +16,23 @@ version = 2
 # RUSTSEC-2026-0253 is separately bounded to Tantivy's sole
 # LruCache<usize, Block>: the advisory requires a key with a panicking Drop,
 # which usize cannot provide. Remove it when Tantivy permits lru >=0.18.2.
+# 2026-11-17 maintenance dispositions (paired with .cargo/audit.toml):
+# chrono is reachable in core/HTTP/SSL, including key/certificate expiry and
+# analytics; chrono-tz reaches Arrow/DataFusion date/time operations; humantime
+# reaches object_store duration configuration parsing. These three notices are
+# informational unmaintained reports with no patched versions. The assessed
+# Arrow 60.1.0, DataFusion 55.3.0 and object_store 0.14.2 releases still require
+# this graph, so changing direct chrono calls alone cannot remove it.
+# Migration/review: private Bead flapjack-56f, review by 2026-12-17. REMOVE the
+# exact IDs in both configs when a maintained compatible graph is validated or
+# the notices are withdrawn; preserve expiry, parsing and analytics behavior.
 ignore = [
     { id = "RUSTSEC-2026-0194", reason = "quadratic-runtime DoS in quick-xml; fix (>=0.41) unreachable behind rust-s3 0.37.2 (latest); S3-response parsing only" },
     { id = "RUSTSEC-2026-0195", reason = "NsReader memory-exhaustion DoS in quick-xml; fix (>=0.41) unreachable behind rust-s3 0.37.2 (latest); S3-response parsing only" },
     { id = "RUSTSEC-2026-0253", reason = "2026-08-12: lru panic-safety fix (>=0.18.2) is unreachable behind latest tantivy 0.26.1 (^0.16.3); Tantivy's sole cache key is usize, whose Drop cannot panic" },
+    { id = "RUSTSEC-2026-0542", reason = "2026-11-17: humantime maintenance notice; object_store duration parser remains reachable; no patched version; remove after maintained graph migration tracked in flapjack-56f" },
+    { id = "RUSTSEC-2026-0543", reason = "2026-11-17: chrono maintenance notice; runtime expiry/date operations remain reachable; no patched version; remove after maintained graph migration tracked in flapjack-56f" },
+    { id = "RUSTSEC-2026-0555", reason = "2026-11-17: chrono-tz maintenance notice; Arrow/DataFusion date/time operations remain reachable; no patched version; remove after maintained graph migration tracked in flapjack-56f" },
 ]
 
 [licenses]
