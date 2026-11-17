@@ -50,7 +50,7 @@
       "minimum_tier": "candidate",
       "owner_jobs": [".github/workflows/ci.yml#rust-tests-fast"],
       "required_fragments": [
-        "cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json",
+        "exec python3 tests/extract_candidate_binary.py --build candidate_build.json",
         "id: candidate-build",
         "python3 tests/test_ci_test_tiers.py --verify",
         "timeout --kill-after=60s 300s \"${{ steps.candidate-build.outputs.executable }}\""
@@ -182,7 +182,7 @@
       "required_fragments": ["docker/build-push-action@v6", "engine/Dockerfile"],
       "risks": ["release"]
     },
-    {"id": "private_candidate", "minimum_tier": "candidate", "owner_jobs": [".github/workflows/private-ci.yml#check"], "required_fragments": ["name: Private candidate gate", "cargo test -p flapjack --lib --no-run", "timeout --kill-after=60s 300s", "bash engine/tests/ci_test_timeout_cap_acceptance.sh"], "risks": ["core_search_index", "durability", "test_harness_integrity"]}
+    {"id": "private_candidate", "minimum_tier": "candidate", "owner_jobs": [".github/workflows/private-ci.yml#check"], "required_fragments": ["name: Private candidate gate", "exec python3 tests/extract_candidate_binary.py --build candidate_build.json", "python3 engine/tests/test_extract_candidate_binary.py", "timeout --kill-after=60s 300s", "bash engine/tests/ci_test_timeout_cap_acceptance.sh"], "risks": ["core_search_index", "durability", "test_harness_integrity"]}
   ],
   "ignored_tests": [
     {"source": "engine/flapjack-replication/src/config_bootstrap_tests.rs", "name": "managed_fleet_ha_provisioning_fixture_verdict", "minimum_tier": "manual_evidence"},

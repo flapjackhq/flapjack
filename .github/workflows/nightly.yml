@@ -110,13 +110,14 @@ jobs:
     name: Dashboard all tests
     needs: check-repo
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: engine
+          prefix-key: v0-rust-ubuntu-24.04
       - name: Create dashboard dist stub (for RustEmbed)
         working-directory: engine
         run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html

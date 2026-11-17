@@ -200,7 +200,7 @@ jobs:
       - name: Build candidate core test binary
         id: candidate-build
         timeout-minutes: 30
-        run: cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"
+        run: exec python3 tests/extract_candidate_binary.py --build candidate_build.json "$GITHUB_OUTPUT"
       - name: Candidate test-tier inventory
         timeout-minutes: 10
         run: python3 tests/test_ci_test_tiers.py --verify
@@ -225,13 +225,14 @@ jobs:
     name: Build server binary
     needs: check-repo
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: engine
+          prefix-key: v0-rust-ubuntu-24.04
       - name: Create dashboard dist stub (for RustEmbed)
         working-directory: engine
         run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
@@ -383,7 +384,7 @@ jobs:
     name: Dashboard page tests
     needs: [check-repo, build-server]
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Download server binary
@@ -439,7 +440,7 @@ jobs:
     name: Dashboard full e2e tests
     needs: [check-repo, build-server]
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Download server binary
@@ -498,7 +499,7 @@ jobs:
     name: Dashboard integration tests
     needs: [check-repo, build-server]
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Download server binary
