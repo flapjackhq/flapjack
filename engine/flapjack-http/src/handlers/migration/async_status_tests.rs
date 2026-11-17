@@ -205,7 +205,7 @@ async fn async_submit_returns_admission_snapshot_and_status_reads_durable_phase(
     assert_eq!(current.disposition, AsyncMigrationDisposition::Running);
     assert!(current.terminal_at.is_none());
 
-    release_documents.notify_waiters();
+    release_documents.notify_one();
     // This test owns the spawned job, so join that exact task instead of using
     // a time-bound status poll. The durable read below still proves the result.
     tokio::time::timeout(
@@ -2261,7 +2261,7 @@ async fn all_source_providers_share_one_migration_job_runner_and_spool() {
             .status(),
         StatusCode::OK
     );
-    release_documents.notify_waiters();
+    release_documents.notify_one();
     let terminal =
         wait_for_route_terminal(&algolia_app, algolia_job_uuid, OWNER_APP, OWNER_KEY).await;
     assert_eq!(terminal["disposition"], "cancelled");
@@ -2438,7 +2438,7 @@ async fn meilisearch_http_submission_uses_shared_cancel_recovery_ack_and_gc_life
     let cancel = send_cancel_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
     assert_eq!(cancel.status(), StatusCode::OK);
     assert_eq!(body_json(cancel).await["disposition"], "running");
-    release_documents.notify_waiters();
+    release_documents.notify_one();
     let terminal = wait_for_route_terminal(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
     assert_eq!(terminal["disposition"], "cancelled");
     assert!(terminal.get("terminalAt").is_some());

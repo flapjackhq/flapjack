@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.17] - 2026-11-16
+
+### Added
+
+- Internal application configuration endpoints support cloud index creation and coherent application dictionary generations.
+
+### Changed
+
+- Routine aarch64 upgrades bind to the published v1.0.16 release artifact.
+
 ### Removed
 
 - **The Flapjack-specific client SDKs are retired; the supported clients are the official Algolia SDKs.** `sdks/` (eleven generated language clients and the WordPress plugin) is deleted with its CI jobs and the `--go` / `--sdk-host-safety` test flags. Sources remain in git history. Registry deprecation and removal actions and the public history tag `sdks-retired-2026-09` remain pending operator work.
