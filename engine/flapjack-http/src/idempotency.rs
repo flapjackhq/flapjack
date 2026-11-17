@@ -347,8 +347,10 @@ impl IdempotencyStore for SqliteStore {
     fn len(&self) -> usize {
         if let Ok(conn) = self.conn.lock() {
             conn.query_row("SELECT COUNT(*) FROM idempotency_cache", [], |row| {
-                row.get(0)
+                row.get::<_, i64>(0)
             })
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
             .unwrap_or(0)
         } else {
             0
@@ -430,9 +432,10 @@ impl DeferredSqliteStore {
             .flatten()
             .and_then(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM idempotency_cache", [], |row| {
-                    row.get(0)
+                    row.get::<_, i64>(0)
                 })
                 .ok()
+                .and_then(|count| usize::try_from(count).ok())
             })
             .unwrap_or(0)
     }

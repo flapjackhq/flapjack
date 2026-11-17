@@ -43,6 +43,8 @@ receive only a read-only token. Foreign repositories run neither gate.
 The private gate runs contract checks, Rustfmt and the bounded core suite.
 Its 40-minute job separates the 30-minute cold-compilation cap from the existing
 300-second core execution cap; each fast job retains its own dependency cache.
+The core build uses `exec python3 tests/extract_candidate_binary.py --build` to own
+and stop its compiler process group before returning or publishing the JSON handoff.
 Known docs/SDK-only diffs skip Rust tests. New mirror candidates compare against
 their main merge base and ignore validated sync provenance; unknown and
 provenance-only diffs run Rust tests. Private maintainers can also dispatch

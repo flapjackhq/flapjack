@@ -11,6 +11,38 @@ export function assert(condition, message) {
   }
 }
 
+function transportFailureDetails(error) {
+  // SDK frames also contain credentials and payloads. Keep only bounded wire
+  // metadata, and never let diagnostic formatting change the runner's verdict.
+  try {
+    if (!Array.isArray(error?.stackTrace)) return [];
+    const deadline = (value) => typeof value === 'number'
+      && Number.isFinite(value) && value >= 0 && value <= 3_600_000 ? value : undefined;
+    return error.stackTrace.slice(-3).flatMap((frame) => {
+      try {
+        const { request, response } = frame;
+        if (typeof request?.url !== 'string') return [];
+        const url = new URL(request.url);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return [];
+        return [JSON.stringify({
+          method: typeof request.method === 'string' && /^[A-Z]{1,12}$/.test(request.method)
+            ? request.method : 'unknown',
+          path: url.pathname.slice(0, 256),
+          status: Number.isInteger(response.status) && response.status >= 0 && response.status <= 599
+            ? response.status : undefined,
+          isTimedOut: typeof response.isTimedOut === 'boolean' ? response.isTimedOut : undefined,
+          connectTimeoutMs: deadline(request.connectTimeout),
+          responseTimeoutMs: deadline(request.responseTimeout),
+        })];
+      } catch {
+        return [];
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Create a test registry and runner.
  *
@@ -41,6 +73,9 @@ export function createTestRunner() {
       } catch (e) {
         console.log(`✗ ${name}`);
         console.log(`  Error: ${e.message}`);
+        for (const detail of transportFailureDetails(e)) {
+          console.log(`  Transport: ${detail}`);
+        }
         if (e.stack) {
           console.log(`  ${e.stack.split("\n")[1]}`);
         }

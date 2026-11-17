@@ -37,6 +37,8 @@ jobs:
         run: python3 engine/tests/test_ci_test_tiers.py
       - name: CI execution budget contracts
         run: bash engine/tests/ci_test_timeout_cap_acceptance.sh
+      - name: Candidate binary handoff contract
+        run: python3 engine/tests/test_extract_candidate_binary.py
       - name: Backend environment contracts
         run: python3 engine/tests/test_dashboard_e2e_backend_contract.py
       - name: Rust test routing
@@ -66,8 +68,7 @@ jobs:
         timeout-minutes: 30
         working-directory: engine
         run: >-
-          cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json &&
-          python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"
+          exec python3 tests/extract_candidate_binary.py --build candidate_build.json "$GITHUB_OUTPUT"
       - name: Candidate core tests
         if: steps.paths.outputs.rust-needed == 'true'
         timeout-minutes: 6

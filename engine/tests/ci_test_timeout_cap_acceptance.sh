@@ -577,8 +577,8 @@ assert_duplicate_step_name_regression_fixture
 assert_duplicate_step_fixture_guards_wrong_failure_mode
 assert_duplicate_step_fixture_ignores_helper_prose_changes
 assert_wrong_job_same_name_fixture
-assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build candidate core test binary" 'cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"' "30"
-assert_step_contract "$PRIVATE_WORKFLOW" "private-ci.yml" "Build candidate core test binary" 'cargo test -p flapjack --lib --no-run --message-format=json > candidate_build.json && python3 tests/extract_candidate_binary.py candidate_build.json "$GITHUB_OUTPUT"' "30"
+assert_step_contract "$CI_WORKFLOW" "ci.yml" "Build candidate core test binary" 'exec python3 tests/extract_candidate_binary.py --build candidate_build.json "$GITHUB_OUTPUT"' "30"
+assert_step_contract "$PRIVATE_WORKFLOW" "private-ci.yml" "Build candidate core test binary" 'exec python3 tests/extract_candidate_binary.py --build candidate_build.json "$GITHUB_OUTPUT"' "30"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate test-tier inventory" "python3 tests/test_ci_test_tiers.py --verify" "10"
 assert_step_contract "$CI_WORKFLOW" "ci.yml" "Candidate core tests" 'timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"' "6"
 assert_step_contract "$PRIVATE_WORKFLOW" "private-ci.yml" "Candidate core tests" 'timeout --kill-after=60s 300s "${{ steps.candidate-build.outputs.executable }}"' "6"

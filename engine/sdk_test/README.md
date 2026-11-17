@@ -36,8 +36,14 @@ E2E modes subsume SDK client coverage and omit the protocol smokes.
 
 The existing `sdk-contract` CI job selects Python 3.12 and invokes the same shell
 entrypoint. Its recurring regressions are `npm run test:runner-shell`,
-`npm run test:python-client:unit` (no server needed), and the existing
+`npm run test:python-client:unit` (no server needed),
+`npm run test:runner-diagnostics`, and the existing
 `npm run test:real_clients:wiring`.
+
+Runner diagnostics use the official clients against controlled loopback failures.
+They retain the original failure counts, cleanup and exit status while reporting
+bounded request path/status/deadline metadata without credentials or payloads.
+Failed SDK CI jobs retain the local fixture server log for seven days.
 
 ## Real InstantSearch clients
 
