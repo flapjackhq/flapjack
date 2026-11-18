@@ -3002,7 +3002,7 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flapjack"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "aes-gcm-siv",
  "arrow",
@@ -3066,7 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "flapjack-http"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "aes-gcm-siv",
  "aws-config",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "flapjack-replication"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "dashmap",
  "flapjack",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "flapjack-server"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -3168,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "flapjack-ssl"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "chrono",
  "dashmap",

@@ -92,6 +92,10 @@ pub fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
     utils::ensure_private_directory(path)
 }
 
+// This is the existing on-disk prefix limit. Sharing it with query building
+// keeps long-token fallback aligned without changing tokenizer/schema behavior.
+pub(crate) const MAX_INDEXED_PREFIX_CHARS: usize = 20;
+
 /// Cached facet query results per tenant index: `(timestamp, hit_count, facet_values, facet_stats, exhaustive)`.
 pub(crate) type FacetCacheEntry = Arc<(
     std::time::Instant,
@@ -532,11 +536,17 @@ impl Index {
             Some(lang) => tantivy::tokenizer::TextAnalyzer::builder(base_tokenizer.clone())
                 .filter(tantivy::tokenizer::LowerCaser)
                 .filter(tantivy::tokenizer::Stemmer::new(lang))
-                .filter(crate::tokenizer::EdgeNgramTokenFilter::new(2, 20))
+                .filter(crate::tokenizer::EdgeNgramTokenFilter::new(
+                    2,
+                    MAX_INDEXED_PREFIX_CHARS,
+                ))
                 .build(),
             None => tantivy::tokenizer::TextAnalyzer::builder(base_tokenizer.clone())
                 .filter(tantivy::tokenizer::LowerCaser)
-                .filter(crate::tokenizer::EdgeNgramTokenFilter::new(2, 20))
+                .filter(crate::tokenizer::EdgeNgramTokenFilter::new(
+                    2,
+                    MAX_INDEXED_PREFIX_CHARS,
+                ))
                 .build(),
         };
 
@@ -933,7 +943,8 @@ impl Index {
             }
         }
 
-        let result: Vec<String> = paths.into_iter().collect();
+        let mut result: Vec<String> = paths.into_iter().collect();
+        result.sort();
         {
             let mut cache = self.searchable_paths_cache.write().unwrap();
             *cache = Some(result.clone());

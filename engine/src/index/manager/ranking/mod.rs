@@ -5,6 +5,7 @@ pub(super) use comparison::*;
 pub(super) use criteria::*;
 
 use super::*;
+use crate::index::settings::{configured_searchable_attributes, resolve_searchable_attribute};
 use crate::index::DEFAULT_RELEVANCY_STRICTNESS;
 
 pub(super) struct RankedDoc {
@@ -170,6 +171,9 @@ pub(super) fn sort_results_with_stage2_ranking(
         custom_normalization,
     );
     let ranking_criteria = parse_ranking_criteria(settings);
+    let attribute_criterion_enabled = ranking_criteria
+        .iter()
+        .any(|criterion| matches!(criterion, RankingCriterion::Attribute));
     let custom_specs = parse_custom_ranking_specs(settings);
     let prefix_eligible = compute_prefix_eligible(query_type, query_terms.len(), query_text);
     let effective_min_proximity = min_proximity
@@ -184,23 +188,22 @@ pub(super) fn sort_results_with_stage2_ranking(
     let attribute_criteria_computed_by_min_proximity = settings
         .and_then(|s| s.attribute_criteria_computed_by_min_proximity)
         .unwrap_or(false);
-    // `unordered(attr)` disables the position/proximity signal for that attribute.
-    let unordered_paths: HashSet<String> = settings
+    let configured = settings
         .and_then(|s| s.searchable_attributes.as_ref())
-        .map(|attrs| {
-            attrs
-                .iter()
-                .filter_map(|attr| {
-                    let stripped = strip_unordered_prefix(attr);
-                    (stripped != attr).then_some(stripped.to_string())
-                })
-                .collect()
-        })
+        .map(|attrs| configured_searchable_attributes(attrs))
         .unwrap_or_default();
-    let unordered_path_indexes: HashSet<usize> = searchable_paths
+    let attribute_configs: Vec<_> = searchable_paths
+        .iter()
+        .map(|path| resolve_searchable_attribute(path, &configured))
+        .collect();
+    let unordered_path_indexes: HashSet<usize> = attribute_configs
         .iter()
         .enumerate()
-        .filter_map(|(idx, path)| unordered_paths.contains(path).then_some(idx))
+        .filter_map(|(idx, config)| {
+            config
+                .is_some_and(|(_, unordered)| unordered)
+                .then_some(idx)
+        })
         .collect();
     let term_alternatives = build_term_alternatives(
         &query_terms,
@@ -258,18 +261,28 @@ pub(super) fn sort_results_with_stage2_ranking(
                 exact_on_single_word_query,
                 disable_exact_on_attributes,
             );
-            let best_attribute_index = compute_best_attribute_index(
-                &query_terms,
-                &tokens_by_path,
-                &AttributeRankingConfig {
-                    prefix_eligible: &prefix_eligible,
-                    min_word_size_for_1_typo,
-                    min_word_size_for_2_typos,
-                    attribute_criteria_computed_by_min_proximity,
-                    min_proximity: effective_min_proximity,
-                    unordered_path_indexes: &unordered_path_indexes,
-                },
-            );
+            let best_attribute_index = if attribute_criterion_enabled {
+                let path_index = compute_best_attribute_index(
+                    &query_terms,
+                    &tokens_by_path,
+                    &AttributeRankingConfig {
+                        prefix_eligible: &prefix_eligible,
+                        min_word_size_for_1_typo,
+                        min_word_size_for_2_typos,
+                        attribute_criteria_computed_by_min_proximity,
+                        min_proximity: effective_min_proximity,
+                        unordered_path_indexes: &unordered_path_indexes,
+                    },
+                );
+                attribute_configs
+                    .get(path_index)
+                    .copied()
+                    .flatten()
+                    .map(|(rank, _)| rank)
+                    .unwrap_or(usize::MAX)
+            } else {
+                0
+            };
             let proximity_bucket = compute_proximity_score(
                 &query_terms,
                 &tokens_by_path,

@@ -522,3 +522,227 @@ fn disables_typo_tolerance_for_attributes() {
         "disabled typo attributes should suppress fuzzy clauses for that attribute only"
     );
 }
+
+// Search through the production IndexManager writer, then pin parser path order
+// to make the historical fuzzy cap defect reproducible rather than probabilistic.
+async fn recall_fixture() -> (tempfile::TempDir, std::sync::Arc<crate::IndexManager>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = crate::IndexManager::new(tmp.path());
+    manager.create_tenant("recall").unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../sdk_test/fixtures/algolia_migrant_recall.json"
+    ))
+    .unwrap();
+    let docs = fixture["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| {
+            let fields = object
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.as_str() != "objectID")
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        match value {
+                            serde_json::Value::String(text) => {
+                                crate::FieldValue::Text(text.clone())
+                            }
+                            serde_json::Value::Number(number) => {
+                                crate::FieldValue::Integer(number.as_i64().unwrap())
+                            }
+                            _ => panic!("unsupported fixture value"),
+                        },
+                    )
+                })
+                .collect();
+            crate::Document {
+                id: object["objectID"].as_str().unwrap().to_owned(),
+                fields,
+            }
+        })
+        .collect();
+    manager.add_documents_sync("recall", docs).await.unwrap();
+    (tmp, manager)
+}
+
+fn pinned_recall_ids(
+    manager: &crate::IndexManager,
+    paths: &[&str],
+    query: &str,
+    typos: bool,
+) -> Vec<String> {
+    let index = manager.get_or_load("recall").unwrap();
+    let schema = index.inner().schema();
+    let parser = QueryParser::new_with_weights(
+        &schema,
+        vec![schema.get_field("_json_search").unwrap()],
+        vec![1.0; paths.len()],
+        paths.iter().map(|s| (*s).to_string()).collect(),
+    )
+    .with_exact_field(schema.get_field("_json_exact").unwrap())
+    .with_typo_tolerance(typos);
+    let query = parser
+        .parse(&Query {
+            text: query.to_string(),
+        })
+        .unwrap();
+    let result = crate::QueryExecutor::new(index.converter(), schema)
+        .execute(&index.reader().searcher(), query, None, 100)
+        .unwrap();
+    let mut ids: Vec<_> = result
+        .documents
+        .into_iter()
+        .map(|d| d.document.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+macro_rules! recall_case {
+    ($name:ident, $query:expr, $expected:expr, $typos:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let (_tmp, manager) = recall_fixture().await;
+            let paths = if $expected == "p5" {
+                ["name", "brand", "category", "sku", "description"]
+            } else {
+                ["name", "brand", "category", "description", "sku"]
+            };
+            assert_eq!(
+                pinned_recall_ids(&manager, &paths, $query, $typos),
+                [$expected],
+                "{}",
+                $query
+            );
+        }
+    };
+}
+recall_case!(
+    recall_assertion_1_late_typo,
+    "trail waterprof membrane",
+    "p1",
+    true
+);
+recall_case!(
+    recall_assertion_2_late_typo,
+    "northpeak footwear lightwieght",
+    "p1",
+    true
+);
+recall_case!(
+    recall_assertion_3_long_exact,
+    "rechtsschutzversicherungsgesellschaften",
+    "p5",
+    true
+);
+recall_case!(
+    recall_assertion_4_long_prefix,
+    "rechtsschutzversicherungs",
+    "p5",
+    false
+);
+recall_case!(
+    recall_assertion_5_long_final,
+    "folder rechtsschutzversicherungsgesellschaften",
+    "p5",
+    true
+);
+recall_case!(
+    recall_assertion_6_long_id,
+    "3f2b8c1e9d4a4b7f8a6c5e1d2f3a4b5c",
+    "p6",
+    true
+);
+recall_case!(
+    recall_assertion_7_uuid,
+    "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "p6",
+    false
+);
+
+#[tokio::test]
+async fn recall_path_permutation_assertion_8() {
+    let (_tmp, manager) = recall_fixture().await;
+    let early = ["description", "sku", "name", "brand", "category"];
+    let late = ["name", "brand", "category", "description", "sku"];
+    for query in ["trail waterprof membrane", "northpeak footwear lightwieght"] {
+        let early_ids = pinned_recall_ids(&manager, &early, query, true);
+        assert_eq!(early_ids, ["p1"]);
+        assert_eq!(
+            pinned_recall_ids(&manager, &late, query, true),
+            early_ids,
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_long_exact_fallback_stems_like_non_prefix_tokens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = crate::IndexManager::new(tmp.path());
+    manager.create_tenant("stemmed").unwrap();
+    let settings = crate::index::settings::IndexSettings {
+        index_languages: vec!["en".to_string()],
+        ..Default::default()
+    };
+    settings
+        .save(tmp.path().join("stemmed/settings.json"))
+        .unwrap();
+    manager.unload_tenant("stemmed");
+    manager.invalidate_settings_cache("stemmed");
+    manager
+        .add_documents_sync(
+            "stemmed",
+            vec![crate::Document {
+                id: "long".into(),
+                fields: [(
+                    "name".into(),
+                    crate::FieldValue::Text("internationalizations".into()),
+                )]
+                .into_iter()
+                .collect(),
+            }],
+        )
+        .await
+        .unwrap();
+    let options = crate::index::SearchOptions {
+        typo_tolerance: Some(false),
+        ..Default::default()
+    };
+    for query in ["internationalizations", "INTERNATIONALIZATIONS"] {
+        let result = manager
+            .search_with_options("stemmed", query, &options)
+            .unwrap();
+        assert_eq!(result.total, 1, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn recall_default_paths_stay_sorted_after_writes_and_invalidation() {
+    let (_tmp, manager) = recall_fixture().await;
+    let index = manager.get_or_load("recall").unwrap();
+    let mut expected = index.searchable_paths();
+    expected.sort();
+    for step in 0..3 {
+        assert_eq!(index.searchable_paths(), expected);
+        manager
+            .add_documents_sync(
+                "recall",
+                vec![crate::Document {
+                    id: format!("new{step}"),
+                    fields: [(
+                        "description".into(),
+                        crate::FieldValue::Text("unrelated".into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }],
+            )
+            .await
+            .unwrap();
+        index.invalidate_searchable_paths_cache();
+    }
+}

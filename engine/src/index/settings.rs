@@ -18,6 +18,85 @@ pub fn strip_unordered_prefix(attr: &str) -> &str {
     attr
 }
 
+/// Expand one same-priority searchable-attribute group, retaining unordered flags.
+/// Commas inside `unordered(...)` belong to that wrapper, while commas between
+/// attributes group them at equal rank. Both query weighting and reranking use it.
+pub(crate) fn searchable_attribute_group(attr: &str) -> Vec<(&str, bool)> {
+    let mut groups = Vec::new();
+    let (mut start, mut depth) = (0, 0_usize);
+    for (offset, character) in attr.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                groups.push(&attr[start..offset]);
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    groups.push(&attr[start..]);
+    let mut members = Vec::new();
+    for group in groups {
+        let group = group.trim();
+        let stripped = strip_unordered_prefix(group);
+        members.extend(
+            stripped
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| (name, stripped != group)),
+        );
+    }
+    if members.len() > 1 {
+        // Algolia comma groups always ignore position inside each member.
+        for (_, unordered) in &mut members {
+            *unordered = true;
+        }
+    }
+    members
+}
+
+/// One rank per configured entry; comma-group members share that rank and
+/// duplicate names retain their first occurrence without consuming a new rank.
+pub(crate) fn configured_searchable_attributes(attrs: &[String]) -> Vec<(&str, usize, bool)> {
+    let mut seen = HashSet::new();
+    let mut configured = Vec::new();
+    let mut rank = 0;
+    for attr in attrs {
+        let mut added = false;
+        for (name, unordered) in searchable_attribute_group(attr) {
+            if seen.insert(name) {
+                configured.push((name, rank, unordered));
+                added = true;
+            }
+        }
+        if added {
+            rank += 1;
+        }
+    }
+    configured
+}
+
+/// Resolve a stored leaf path to its first configured attribute (including a
+/// dotted parent). Keep raw dictionary bytes out of the public settings syntax.
+pub(crate) fn resolve_searchable_attribute(
+    path: &str,
+    configured: &[(&str, usize, bool)],
+) -> Option<(usize, bool)> {
+    let logical = path.replace('\u{1}', ".");
+    configured
+        .iter()
+        .filter(|(name, _, _)| {
+            logical == *name
+                || logical
+                    .strip_prefix(*name)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .min_by_key(|(_, rank, _)| *rank)
+        .map(|(_, rank, unordered)| (*rank, *unordered))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RankingCriterionToken {
     Typo,

@@ -3148,10 +3148,12 @@ async fn test_secured_mode_rejects_bad_credentials() {
 
 mod algolia_equivalence {
     use super::common::{self, spawn_server};
+    use futures::FutureExt;
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::env;
     use std::fs;
+    use std::panic::AssertUnwindSafe;
     use std::path::Path;
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -3164,6 +3166,66 @@ mod algolia_equivalence {
         filters: Option<String>,
         expected_hits: Vec<Value>,
         expected_nb_hits: usize,
+    }
+
+    async fn cleanup_algolia_fixture(app_id: &str, api_key: &str, index_name: &str) {
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://{}-dsn.algolia.net/1/indexes/{}",
+            app_id, index_name
+        );
+        let response = client
+            .delete(&url)
+            .header("x-algolia-api-key", api_key)
+            .header("x-algolia-application-id", app_id)
+            .send()
+            .await
+            .expect("fixture delete failed");
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return;
+        }
+        let deleted: Value = response
+            .error_for_status()
+            .expect("fixture delete refused")
+            .json()
+            .await
+            .unwrap();
+        let task_id = deleted["taskID"].as_u64().expect("delete task ID missing");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let task: Value = client
+                .get(format!("{}/task/{}", url, task_id))
+                .header("x-algolia-api-key", api_key)
+                .header("x-algolia-application-id", app_id)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .expect("delete task lookup failed")
+                .json()
+                .await
+                .unwrap();
+            if task["status"] == "published" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup task deadline for {index_name}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let absent = client
+            .get(format!("{}/settings", url))
+            .header("x-algolia-api-key", api_key)
+            .header("x-algolia-application-id", app_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            absent.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "fixture remains: {index_name}"
+        );
     }
 
     async fn capture_from_algolia(
@@ -3269,10 +3331,29 @@ mod algolia_equivalence {
         let api_key = env::var("ALGOLIA_ADMIN_KEY")
             .expect("Fixture missing and ALGOLIA_ADMIN_KEY not in .secret/.env.secret");
 
-        let index_name = format!("flapjack_test_{}", uuid::Uuid::new_v4());
+        let index_prefix =
+            env::var("ALGOLIA_TEST_INDEX_PREFIX").unwrap_or_else(|_| "flapjack_test_".to_string());
+        assert!(
+            !index_prefix.is_empty()
+                && index_prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "invalid test index prefix"
+        );
+        let index_name = format!("{}{}", index_prefix, uuid::Uuid::new_v4());
 
-        let fixture =
-            capture_from_algolia(&app_id, &api_key, &index_name, test_data, query, filters).await;
+        let captured = AssertUnwindSafe(capture_from_algolia(
+            &app_id,
+            &api_key,
+            &index_name,
+            test_data,
+            query,
+            filters,
+        ))
+        .catch_unwind()
+        .await;
+        cleanup_algolia_fixture(&app_id, &api_key, &index_name).await;
+        let fixture = captured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
         fs::create_dir_all("tests/fixtures/algolia").unwrap();
         fs::write(
@@ -3697,9 +3778,18 @@ mod algolia_equivalence {
         let api_key = env::var("ALGOLIA_ADMIN_KEY")
             .expect("Fixture missing and ALGOLIA_ADMIN_KEY not in .secret/.env.secret");
 
-        let index_name = format!("flapjack_test_{}", uuid::Uuid::new_v4());
+        let index_prefix =
+            env::var("ALGOLIA_TEST_INDEX_PREFIX").unwrap_or_else(|_| "flapjack_test_".to_string());
+        assert!(
+            !index_prefix.is_empty()
+                && index_prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "invalid test index prefix"
+        );
+        let index_name = format!("{}{}", index_prefix, uuid::Uuid::new_v4());
 
-        let fixture = capture_synonym_test_from_algolia(
+        let captured = AssertUnwindSafe(capture_synonym_test_from_algolia(
             &app_id,
             &api_key,
             &index_name,
@@ -3707,8 +3797,11 @@ mod algolia_equivalence {
             synonyms,
             query,
             replace_synonyms_in_highlight,
-        )
+        ))
+        .catch_unwind()
         .await;
+        cleanup_algolia_fixture(&app_id, &api_key, &index_name).await;
+        let fixture = captured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
         fs::create_dir_all("tests/fixtures/algolia").unwrap();
         fs::write(

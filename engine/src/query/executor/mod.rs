@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::index::document::DocumentConverter;
-use crate::index::settings::{strip_unordered_prefix, IndexSettings};
+use crate::index::settings::{configured_searchable_attributes, IndexSettings};
 use crate::query::filter::FilterCompiler;
 use crate::query::parser::ShortQueryPlaceholder;
 use crate::types::{Filter, ScoredDocument, SearchResult};
@@ -141,17 +141,12 @@ impl QueryExecutor {
 
         if let Some(ref s) = settings {
             if let Some(ref attrs) = s.searchable_attributes {
-                // Strip `unordered(...)` wrapper and track which paths are unordered.
-                self.searchable_paths = attrs
-                    .iter()
-                    .map(|a| {
-                        let stripped = strip_unordered_prefix(a).to_string();
-                        if stripped != *a {
-                            self.unordered_paths.insert(stripped.clone());
-                        }
-                        stripped
-                    })
-                    .collect();
+                for (path, _, unordered) in configured_searchable_attributes(attrs) {
+                    if unordered {
+                        self.unordered_paths.insert(path.to_string());
+                    }
+                    self.searchable_paths.push(path.to_string());
+                }
             }
         }
         self.settings = settings;

@@ -7,6 +7,23 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.18] - 2026-11-18
+
+### Fixed
+
+- Default prefix searches find long identifiers and compounds, including prefixes beyond 20 characters, without reindexing.
+- Typo tolerance covers every searchable attribute for multi-word queries.
+- Explicit searchable attributes exclude unlisted fields and preserve nested attributes and equal-priority groups.
+
+### Changed
+
+- Indexes without configured searchable attributes use deterministic paths and disable attribute-position ranking. Ranking changes once, then remains stable across writes.
+- Routine aarch64 upgrades bind to the published v1.0.17 release artifact; existing data directories are preserved.
+
+### Added
+
+- An Algolia-captured 30-record fixture with 27 official-client search assertions and a large-dictionary fuzzy-query p99 guard.
+
 ## [1.0.17] - 2026-11-16
 
 ### Added
