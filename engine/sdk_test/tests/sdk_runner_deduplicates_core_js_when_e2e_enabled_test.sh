@@ -75,7 +75,7 @@ case "${1:-}" in
       *require.resolve*) exit 0 ;;
       *) exit 65 ;;
     esac ;;
-  test.js|contract_tests.js|full_compat_tests.js|instantsearch_contract_tests.js) ;;
+  test.js|contract_tests.js|algolia_migrant_recall.js|full_compat_tests.js|instantsearch_contract_tests.js) ;;
   scripts/playwright-webserver.mjs) ;;
   *) exit 66 ;;
 esac
@@ -140,7 +140,7 @@ run_mode() {
     exit 1
   fi
   grep -Fq "$prefix: official Python client contract" "$OUTPUT_FILE"
-  for script_name in test.js contract_tests.js full_compat_tests.js instantsearch_contract_tests.js; do
+  for script_name in test.js contract_tests.js algolia_migrant_recall.js full_compat_tests.js instantsearch_contract_tests.js; do
     assert_count 1 "$script_name" "$STUB_NODE_LOG"
   done
   assert_count 1 "cwd=$SDK_TEST_DIR args=run test:real_clients" "$STUB_NPM_LOG"

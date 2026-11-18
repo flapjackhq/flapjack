@@ -31,7 +31,8 @@ class RunnerShutdownTest(unittest.TestCase):
                 "import os, pathlib, signal, sys\n"
                 f"signal.signal(signal.SIGTERM, lambda *_: sys.exit({shutdown_status}))\n"
                 "signal.alarm(5)\n"
-                "pathlib.Path('ready').write_text(str(os.getpid()))\n"
+                "pathlib.Path('ready.tmp').write_text(str(os.getpid()))\n"
+                "pathlib.Path('ready.tmp').replace('ready')\n"
                 "signal.pause()\n"
             )
             script = "\n".join([

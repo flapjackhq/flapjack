@@ -44,6 +44,13 @@ pub(super) fn normalize_meilisearch_settings(
             "searchableAttributes",
             "searchableAttributes",
         )?;
+        if let Some(Value::Array(attributes)) = normalized.get_mut("searchableAttributes") {
+            // Meilisearch's automatic all-fields default is a singleton wildcard;
+            // Algolia/Flapjack express all fields with an empty attribute list.
+            if attributes.len() == 1 && attributes[0].as_str() == Some("*") {
+                attributes.clear();
+            }
+        }
         copy_string_array(
             source,
             &mut normalized,
