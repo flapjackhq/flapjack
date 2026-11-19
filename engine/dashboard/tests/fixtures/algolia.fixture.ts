@@ -1,3 +1,4 @@
+/// <reference lib="es2021.promise" />
 /**
  * @module Stub summary for engine/dashboard/tests/fixtures/algolia.fixture.ts.
  */
@@ -78,7 +79,11 @@ export function buildAlgoliaMigrationIndexName(
   pid = process.pid,
   nonce: string = randomUUID(),
 ): string {
-  return `fj_e2e_migrate_${timestamp}_${pid}_${nonce}`;
+  const prefix = process.env.ALGOLIA_TEST_INDEX_PREFIX ?? 'fj_e2e_migrate_';
+  if (prefix.length > 64 || !/^fj_[a-z0-9_]+_$/.test(prefix)) {
+    throw new Error('Algolia fixture prefix must be an owned fj_ namespace ending with underscore');
+  }
+  return `${prefix}${timestamp}_${pid}_${nonce}`;
 }
 
 export class MissingAlgoliaCredentialsError extends Error {
@@ -255,29 +260,49 @@ export async function seedAlgoliaIndex(): Promise<AlgoliaTestContext> {
   const client = algoliasearch(appId, adminKey);
 
   try {
-    await client.setSettings({ indexName, indexSettings: SETTINGS });
+    const settingsTask = await client.setSettings({ indexName, indexSettings: SETTINGS });
+    await client.waitForTask({ indexName, taskID: settingsTask.taskID });
 
     for (const syn of SYNONYMS) {
-      await client.saveSynonym({
+      const task = await client.saveSynonym({
         indexName,
         objectID: syn.objectID,
         synonymHit: syn as SaveSynonymRequest['synonymHit'],
       });
+      await client.waitForTask({ indexName, taskID: task.taskID });
     }
 
     for (const rule of RULES) {
-      await client.saveRule({
+      const task = await client.saveRule({
         indexName,
         objectID: rule.objectID,
         rule: rule as SaveRuleRequest['rule'],
       });
+      await client.waitForTask({ indexName, taskID: task.taskID });
     }
 
-    await client.saveObjects({ indexName, objects: PRODUCTS });
+    const batches = await client.saveObjects({ indexName, objects: PRODUCTS });
+    for (const { taskID } of batches) {
+      await client.waitForTask({ indexName, taskID });
+    }
     await pollAlgoliaReady(client, indexName, PRODUCTS.length);
+    // Preview consumes application metadata, which search-count readiness alone
+    // does not establish. Fail in Arrange before presenting an unusable source.
+    const metadataResponse = await fetch(buildApiPath('/1/algolia-list-indexes'), {
+      method: 'POST',
+      headers: API_HEADERS,
+      body: JSON.stringify({ appId, apiKey: adminKey }),
+    });
+    const metadata = await metadataResponse.json() as { indexes?: Array<{ name: string; entries: number }> };
+    const selected = Array.isArray(metadata?.indexes)
+      ? metadata.indexes.filter((index) => index && typeof index === 'object' && index.name === indexName) : [];
+    if (!metadataResponse.ok || selected.length !== 1 || selected[0].entries !== PRODUCTS.length) {
+      throw new Error('Algolia fixture source metadata is not ready');
+    }
   } catch (seedError) {
     try {
-      await client.deleteIndex({ indexName });
+      const { taskID } = await client.deleteIndex({ indexName });
+      await client.waitForTask({ indexName, taskID });
     } catch (rollbackError) {
       throw new AggregateError(
         [seedError, rollbackError],

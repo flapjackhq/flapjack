@@ -65,7 +65,6 @@ const SERVER_OWNED_DATA_ROOT_NAMES: &[&str] = &[
 
 use super::OptionalFilterSpecs;
 use super::SearchOptions;
-use crate::index::settings::strip_unordered_prefix;
 
 /// Validate that a tenant/index name is safe in the server's shared data root.
 /// Rejects path traversal, unsafe characters, and names owned by server storage.

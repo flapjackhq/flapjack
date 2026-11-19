@@ -124,7 +124,6 @@ impl QueryParser {
         );
 
         let json_search_field = self.fields[0];
-        let max_fuzzy_paths = self.max_fuzzy_paths(tokens.len());
         let last_idx = tokens.len() - 1;
         let word_queries: Vec<QueryClause> = tokens
             .iter()
@@ -135,7 +134,6 @@ impl QueryParser {
                     token_idx,
                     last_idx,
                     has_trailing_space,
-                    max_fuzzy_paths,
                     json_search_field,
                 )
             })
@@ -149,14 +147,6 @@ impl QueryParser {
         Box::new(tantivy::query::BooleanQuery::new(word_queries))
     }
 
-    fn max_fuzzy_paths(&self, token_count: usize) -> usize {
-        if token_count >= 3 {
-            2.min(self.searchable_paths.len())
-        } else {
-            4.min(self.searchable_paths.len())
-        }
-    }
-
     /// Build the query clause for a single token, choosing prefix vs exact mode based
     /// on position (last token + no trailing space = prefix), and applying word splitting.
     fn build_word_query(
@@ -165,7 +155,6 @@ impl QueryParser {
         token_idx: usize,
         last_idx: usize,
         has_trailing_space: bool,
-        max_fuzzy_paths: usize,
         json_search_field: tantivy::schema::Field,
     ) -> QueryClause {
         let is_prefix = self.is_prefix_token(token_idx, last_idx, has_trailing_space);
@@ -208,7 +197,6 @@ impl QueryParser {
                         is_prefix,
                         target_field,
                         json_search_field,
-                        max_fuzzy_paths,
                         plural_forms: &plural_forms,
                     }),
                 )
@@ -267,7 +255,41 @@ impl QueryParser {
             if context.is_prefix { "search" } else { "exact" }
         );
 
-        let token_query = self.build_term_query(&context, term, &term_text, distance);
+        let token_query = self.build_term_query(&context, term, distance);
+        let token_query: Box<dyn TantivyQuery> = if context.is_prefix
+            && context.token.chars().count() > crate::index::MAX_INDEXED_PREFIX_CHARS
+        {
+            // Existing indexes store edge prefixes only through the fixed maximum.
+            // Keep exact recall independent of typo tolerance and attribute order;
+            // the exact tokenizer stems, while prefix query tokens do not.
+            let exact_field = self.json_exact_field.unwrap_or(context.target_field);
+            let exact_token = self.stem_token(context.token);
+            let exact_term = tantivy::Term::from_field_text(
+                exact_field,
+                &format!("{}\0s{}", context.path, exact_token),
+            );
+            let raw_term = Self::json_path_term(exact_field, context.path, context.token);
+            Box::new(tantivy::query::BooleanQuery::new(vec![
+                (tantivy::query::Occur::Should, token_query),
+                (
+                    tantivy::query::Occur::Should,
+                    Box::new(tantivy::query::TermQuery::new(
+                        exact_term,
+                        tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
+                    )),
+                ),
+                // Zero edit distance enumerates true prefixes in the existing term
+                // dictionary, on every segment, without changing stored n-grams.
+                (
+                    tantivy::query::Occur::Should,
+                    Box::new(tantivy::query::FuzzyTermQuery::new_prefix(
+                        raw_term, 0, true,
+                    )),
+                ),
+            ]))
+        } else {
+            token_query
+        };
         let plural_query = self.wrap_plural_forms(token_query, &context);
         self.apply_query_weight(context.path_idx, plural_query)
     }
@@ -278,7 +300,6 @@ impl QueryParser {
         if !self.typo_tolerance
             || self.disabled_typo_attrs.contains(context.path)
             || self.disabled_typo_words.contains(context.token_lc)
-            || context.path_idx >= context.max_fuzzy_paths
         {
             return 0;
         }
@@ -292,13 +313,24 @@ impl QueryParser {
         }
     }
 
+    /// A typed JSON term constrains fuzzy enumeration to this exact path.
+    /// Treating path bytes as ordinary text permits typos in the field name,
+    /// which can search an excluded or typo-disabled sibling attribute.
+    fn json_path_term(field: tantivy::schema::Field, path: &str, token: &str) -> tantivy::Term {
+        // Paths came from the dictionary: preserve literal dots/backslashes and
+        // its nested U+0001 separators when passing through the public term API.
+        let escaped = path.replace('\\', "\\\\").replace('.', "\\.");
+        let mut term = tantivy::Term::from_field_json_path(field, &escaped, false);
+        term.append_type_and_str(token);
+        term
+    }
+
     /// Build a fuzzy or exact term query for a token, adding a stripped-first-character
     /// fallback term query for short-prefix resilience when fuzzy matching is enabled.
     fn build_term_query(
         &self,
         context: &FieldQueryContext<'_>,
         term: tantivy::Term,
-        term_text: &str,
         distance: u8,
     ) -> Box<dyn TantivyQuery> {
         if distance == 0 {
@@ -312,12 +344,13 @@ impl QueryParser {
             term.clone(),
             tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
         ));
-        let fuzzy_term = if context.is_prefix {
-            let fuzzy_field = self.json_exact_field.unwrap_or(context.target_field);
-            tantivy::Term::from_field_text(fuzzy_field, term_text)
+        let fuzzy_field = self.json_exact_field.unwrap_or(context.target_field);
+        let fuzzy_token = if context.is_prefix {
+            std::borrow::Cow::Borrowed(context.token)
         } else {
-            term
+            self.stem_token(context.token)
         };
+        let fuzzy_term = Self::json_path_term(fuzzy_field, context.path, &fuzzy_token);
         let fuzzy = Box::new(tantivy::query::FuzzyTermQuery::new(
             fuzzy_term, distance, true,
         ));

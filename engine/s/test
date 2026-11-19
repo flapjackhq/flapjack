@@ -370,6 +370,7 @@ run_sdk_core_js_suite() {
 
   run_sdk_node_test "${step_prefix}: JS test.js" "test.js" "SDK test.js passed"
   run_sdk_node_test "${step_prefix}: JS contract_tests.js" "contract_tests.js" "SDK contract_tests.js passed"
+  run_sdk_node_test "${step_prefix}: JS algolia_migrant_recall.js" "algolia_migrant_recall.js" "SDK migrant recall 27 assertions passed"
   run_sdk_node_test "${step_prefix}: JS full_compat_tests.js" "full_compat_tests.js" "SDK full_compat_tests.js passed"
   run_sdk_node_test "${step_prefix}: JS instantsearch_contract_tests.js" "instantsearch_contract_tests.js" "SDK instantsearch_contract_tests.js passed"
   run_sdk_npm_test "${step_prefix}: real InstantSearch clients" "test:real_clients" "Real InstantSearch client conformance passed"

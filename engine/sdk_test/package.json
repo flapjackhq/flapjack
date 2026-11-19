@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node test.js",
-    "test:contract": "node contract_tests.js",
+    "test:contract": "node contract_tests.js && node algolia_migrant_recall.js",
     "test:stage5": "node stage5_algolia_compat.js",
     "test:algolia_compat_broader": "node algolia_compat_broader.js",
     "test:compat": "node full_compat_tests.js",
@@ -16,7 +16,7 @@
     "test:runner-shell": "bash tests/dashboard_runner_bootstrap_node_modules_test.sh && bash tests/dashboard_runner_lockfile_change_reinstalls_node_modules_test.sh && bash tests/dashboard_runner_reuse_node_modules_validation_test.sh && bash tests/sdk_runner_bootstrap_node_modules_test.sh && bash tests/sdk_runner_cache_hit_reuses_node_modules_test.sh && bash tests/sdk_runner_reuse_guard_test.sh && bash tests/sdk_runner_reuse_node_modules_validation_test.sh && bash tests/sdk_runner_deduplicates_core_js_when_e2e_enabled_test.sh && bash tests/python_client_contract_bootstrap_test.sh",
     "test:python-client:unit": "${FLAPJACK_SDK_PYTHON:-python3.12} tests/python_client_contract_unit_test.py",
     "test:runner-diagnostics": "node --test tests/test_helpers_failure_diagnostics_test.mjs",
-    "test:all": "node test.js && node contract_tests.js && node full_compat_tests.js && node instantsearch_contract_tests.js && npm run test:real_clients",
+    "test:all": "node test.js && npm run test:contract && node full_compat_tests.js && node instantsearch_contract_tests.js && npm run test:real_clients",
     "test:full": "npm run test:all",
     "test:migration": "node test_algolia_migration.js",
     "test:migration:verbose": "node test_algolia_migration.js --verbose",
