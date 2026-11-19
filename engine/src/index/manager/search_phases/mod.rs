@@ -1,5 +1,6 @@
 //! Stub summary for engine/src/index/manager/search_phases/mod.rs.
 use super::*;
+use crate::index::settings::{configured_searchable_attributes, resolve_searchable_attribute};
 use crate::index::FacetCacheKey;
 
 mod plural_expansion;
@@ -790,58 +791,27 @@ fn apply_restrict_searchable_attrs(
 }
 
 /// Assign exponentially decaying weights (100^-rank) to searchable paths based on
-/// their position in `searchableAttributes`. Unranked paths receive a weight of 1.0.
+/// their position in `searchableAttributes`. An explicit list excludes unlisted paths.
 pub(super) fn build_searchable_paths_with_weights(
     all_searchable_paths: &[String],
     searchable_attributes: Option<&[String]>,
 ) -> (Vec<String>, Vec<f32>) {
     match searchable_attributes {
-        Some(attrs) => {
+        Some(attrs) if !attrs.is_empty() => {
             let mut weighted: Vec<(String, f32)> = Vec::new();
-            let mut unweighted: Vec<String> = Vec::new();
-            let mut configured_ranks: HashMap<String, usize> = HashMap::new();
-            let mut next_rank = 0usize;
-            let mut unordered_rank: Option<usize> = None;
-            for attr in attrs {
-                let stripped = strip_unordered_prefix(attr);
-                if configured_ranks.contains_key(stripped) {
-                    continue;
-                }
-
-                let rank = if stripped != attr {
-                    *unordered_rank.get_or_insert_with(|| {
-                        let current = next_rank;
-                        next_rank += 1;
-                        current
-                    })
-                } else {
-                    let current = next_rank;
-                    next_rank += 1;
-                    current
-                };
-
-                configured_ranks.insert(stripped.to_string(), rank);
-            }
-
+            let configured = configured_searchable_attributes(attrs);
             for path in all_searchable_paths {
-                if let Some(pos) = configured_ranks.get(path) {
-                    weighted.push((path.clone(), 100_f32.powi(-(*pos as i32))));
-                } else {
-                    unweighted.push(path.clone());
+                if let Some((rank, _)) = resolve_searchable_attribute(path, &configured) {
+                    weighted.push((path.clone(), 100_f32.powi(-(rank as i32))));
                 }
             }
 
             weighted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let mut paths: Vec<String> = weighted.iter().map(|(p, _)| p.clone()).collect();
-            let mut weights: Vec<f32> = weighted.iter().map(|(_, w)| *w).collect();
-            let min_weight = weights.last().copied().unwrap_or(1.0) * 0.01;
-            for path in unweighted {
-                paths.push(path);
-                weights.push(min_weight);
-            }
+            let paths: Vec<String> = weighted.iter().map(|(p, _)| p.clone()).collect();
+            let weights: Vec<f32> = weighted.iter().map(|(_, w)| *w).collect();
             (paths, weights)
         }
-        None => {
+        _ => {
             let weights = vec![1.0; all_searchable_paths.len()];
             (all_searchable_paths.to_vec(), weights)
         }

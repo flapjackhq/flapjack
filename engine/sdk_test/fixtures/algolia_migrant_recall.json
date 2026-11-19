@@ -1,0 +1,525 @@
+{
+  "schemaVersion": 1,
+  "oracle": {
+    "provider": "Algolia",
+    "client": "algoliasearch@5.57.0",
+    "capturedAt": "2026-11-18T20:34:42.399Z",
+    "deviations": []
+  },
+  "objects": [
+    {
+      "objectID": "p1",
+      "name": "Trail Running Shoes",
+      "brand": "Northpeak",
+      "category": "Footwear",
+      "description": "Lightweight waterproof membrane for mountain paths",
+      "sku": "NP-TR-001",
+      "price": 129,
+      "popularity": 90
+    },
+    {
+      "objectID": "p2",
+      "name": "Road Running Shoes",
+      "brand": "Northpeak",
+      "category": "Footwear",
+      "description": "Breathable mesh for city pavement",
+      "sku": "NP-RD-002",
+      "price": 99,
+      "popularity": 80
+    },
+    {
+      "objectID": "p3",
+      "name": "Waterproof Hiking Jacket",
+      "brand": "Alpenglow",
+      "category": "Outerwear",
+      "description": "Seam sealed shell with storm hood",
+      "sku": "AG-HJ-003",
+      "price": 199,
+      "popularity": 70
+    },
+    {
+      "objectID": "p4",
+      "name": "Insulated Bottle",
+      "brand": "Alpenglow",
+      "category": "Accessories",
+      "description": "Keeps drinks cold on long trail days",
+      "sku": "AG-BT-004",
+      "price": 29,
+      "popularity": 10
+    },
+    {
+      "objectID": "p5",
+      "name": "Policy Folder",
+      "brand": "Kanzlei",
+      "category": "Office",
+      "description": "Rechtsschutzversicherungsgesellschaften Ordner",
+      "sku": "KZ-PF-005",
+      "price": 12,
+      "popularity": 30
+    },
+    {
+      "objectID": "p6",
+      "name": "License Card",
+      "brand": "Kanzlei",
+      "category": "Office",
+      "description": "Reference 7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "sku": "3f2b8c1e9d4a4b7f8a6c5e1d2f3a4b5c",
+      "price": 8,
+      "popularity": 20
+    },
+    {
+      "objectID": "p7",
+      "name": "Trail Mix",
+      "brand": "Snackwell",
+      "category": "Food",
+      "description": "Roasted cashews cranberries",
+      "sku": "SW-TM-007",
+      "price": 5,
+      "popularity": 50
+    },
+    {
+      "objectID": "p8",
+      "name": "Jacked Protein Bar",
+      "brand": "Snackwell",
+      "category": "Food",
+      "description": "Cocoa almond snack",
+      "sku": "SW-PB-008",
+      "price": 3,
+      "popularity": 40
+    },
+    {
+      "objectID": "f9",
+      "name": "zzfiller9z",
+      "description": "zzquux9z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f10",
+      "name": "zzfiller10z",
+      "description": "zzquux10z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f11",
+      "name": "zzfiller11z",
+      "description": "zzquux11z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f12",
+      "name": "zzfiller12z",
+      "description": "zzquux12z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f13",
+      "name": "zzfiller13z",
+      "description": "zzquux13z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f14",
+      "name": "zzfiller14z",
+      "description": "zzquux14z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f15",
+      "name": "zzfiller15z",
+      "description": "zzquux15z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f16",
+      "name": "zzfiller16z",
+      "description": "zzquux16z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f17",
+      "name": "zzfiller17z",
+      "description": "zzquux17z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f18",
+      "name": "zzfiller18z",
+      "description": "zzquux18z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f19",
+      "name": "zzfiller19z",
+      "description": "zzquux19z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f20",
+      "name": "zzfiller20z",
+      "description": "zzquux20z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f21",
+      "name": "zzfiller21z",
+      "description": "zzquux21z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f22",
+      "name": "zzfiller22z",
+      "description": "zzquux22z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f23",
+      "name": "zzfiller23z",
+      "description": "zzquux23z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f24",
+      "name": "zzfiller24z",
+      "description": "zzquux24z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f25",
+      "name": "zzfiller25z",
+      "description": "zzquux25z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f26",
+      "name": "zzfiller26z",
+      "description": "zzquux26z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f27",
+      "name": "zzfiller27z",
+      "description": "zzquux27z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f28",
+      "name": "zzfiller28z",
+      "description": "zzquux28z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f29",
+      "name": "zzfiller29z",
+      "description": "zzquux29z",
+      "price": 1,
+      "popularity": 0
+    },
+    {
+      "objectID": "f30",
+      "name": "zzfiller30z",
+      "description": "zzquux30z",
+      "price": 1,
+      "popularity": 0
+    }
+  ],
+  "indexes": {
+    "A": {
+      "settings": {},
+      "reverseKeys": false
+    },
+    "B": {
+      "settings": {},
+      "reverseKeys": true
+    },
+    "C": {
+      "settings": {
+        "searchableAttributes": [
+          "name",
+          "brand",
+          "category",
+          "description"
+        ],
+        "customRanking": [
+          "desc(popularity)"
+        ],
+        "attributesForFaceting": [
+          "searchable(brand)",
+          "category"
+        ]
+      },
+      "reverseKeys": false
+    }
+  },
+  "assertions": [
+    {
+      "id": 1,
+      "index": "A",
+      "query": "trail waterprof membrane",
+      "kind": "ids",
+      "expected": [
+        "p1"
+      ]
+    },
+    {
+      "id": 2,
+      "index": "A",
+      "query": "northpeak footwear lightwieght",
+      "kind": "ids",
+      "expected": [
+        "p1"
+      ]
+    },
+    {
+      "id": 3,
+      "index": "A",
+      "query": "rechtsschutzversicherungsgesellschaften",
+      "kind": "ids",
+      "expected": [
+        "p5"
+      ]
+    },
+    {
+      "id": 4,
+      "index": "A",
+      "query": "rechtsschutzversicherungs",
+      "kind": "ids",
+      "expected": [
+        "p5"
+      ]
+    },
+    {
+      "id": 5,
+      "index": "A",
+      "query": "folder rechtsschutzversicherungsgesellschaften",
+      "kind": "ids",
+      "expected": [
+        "p5"
+      ]
+    },
+    {
+      "id": 6,
+      "index": "A",
+      "query": "3f2b8c1e9d4a4b7f8a6c5e1d2f3a4b5c",
+      "kind": "ids",
+      "expected": [
+        "p6"
+      ]
+    },
+    {
+      "id": 7,
+      "index": "A",
+      "query": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "kind": "ids",
+      "expected": [
+        "p6"
+      ]
+    },
+    {
+      "id": 8,
+      "kind": "equivalentKeyOrder"
+    },
+    {
+      "id": 9,
+      "index": "A",
+      "query": "jacket",
+      "kind": "orderedIDs",
+      "expected": [
+        "p3",
+        "p8"
+      ]
+    },
+    {
+      "id": 10,
+      "index": "A",
+      "query": "jaket",
+      "kind": "ids",
+      "expected": [
+        "p3"
+      ]
+    },
+    {
+      "id": 11,
+      "index": "A",
+      "query": "watrprof",
+      "kind": "ids",
+      "expected": [
+        "p1",
+        "p3"
+      ]
+    },
+    {
+      "id": 12,
+      "index": "A",
+      "query": "hod",
+      "kind": "ids",
+      "expected": []
+    },
+    {
+      "id": 13,
+      "index": "A",
+      "query": "run sho",
+      "kind": "ids",
+      "expected": []
+    },
+    {
+      "id": 14,
+      "index": "A",
+      "query": "running sho",
+      "kind": "ids",
+      "expected": [
+        "p1",
+        "p2"
+      ]
+    },
+    {
+      "id": 15,
+      "index": "A",
+      "query": "bot",
+      "kind": "ids",
+      "expected": [
+        "p4"
+      ]
+    },
+    {
+      "id": 16,
+      "index": "A",
+      "query": "running jacket",
+      "kind": "ids",
+      "expected": []
+    },
+    {
+      "id": 17,
+      "index": "A",
+      "query": "alpenglow bottle",
+      "kind": "ids",
+      "expected": [
+        "p4"
+      ]
+    },
+    {
+      "id": 18,
+      "index": "A",
+      "query": "NP-TR-001",
+      "kind": "ids",
+      "expected": [
+        "p1"
+      ]
+    },
+    {
+      "id": 19,
+      "index": "A",
+      "query": "ALPENGLOW",
+      "kind": "ids",
+      "expected": [
+        "p3",
+        "p4"
+      ]
+    },
+    {
+      "id": 20,
+      "index": "A",
+      "query": "versicherung",
+      "kind": "ids",
+      "expected": []
+    },
+    {
+      "id": 21,
+      "index": "A",
+      "query": "",
+      "kind": "counts",
+      "expected": {
+        "nbHits": 30,
+        "hits": 20
+      }
+    },
+    {
+      "id": 22,
+      "index": "A",
+      "query": "jacket",
+      "kind": "highlight",
+      "objectID": "p3",
+      "attribute": "name",
+      "expected": "Waterproof Hiking <em>Jacket</em>"
+    },
+    {
+      "id": 23,
+      "index": "C",
+      "query": "trail",
+      "kind": "orderedIDs",
+      "expected": [
+        "p1",
+        "p7",
+        "p4"
+      ]
+    },
+    {
+      "id": 24,
+      "index": "C",
+      "query": "",
+      "params": {
+        "facets": [
+          "brand"
+        ]
+      },
+      "kind": "facets",
+      "expected": {
+        "brand": {
+          "Alpenglow": 2,
+          "Kanzlei": 2,
+          "Northpeak": 2,
+          "Snackwell": 2
+        }
+      }
+    },
+    {
+      "id": 25,
+      "index": "C",
+      "query": "",
+      "params": {
+        "filters": "brand:Northpeak AND category:Footwear"
+      },
+      "kind": "ids",
+      "expected": [
+        "p1",
+        "p2"
+      ]
+    },
+    {
+      "id": 26,
+      "index": "C",
+      "facetName": "brand",
+      "facetQuery": "alp",
+      "kind": "facetValues",
+      "expected": [
+        "Alpenglow"
+      ]
+    },
+    {
+      "id": 27,
+      "index": "C",
+      "query": "NP-TR-001",
+      "kind": "ids",
+      "expected": []
+    }
+  ]
+}

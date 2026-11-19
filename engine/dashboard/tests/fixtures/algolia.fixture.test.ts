@@ -10,6 +10,7 @@ import {
   seedAlgoliaIndex,
 } from './algolia.fixture';
 import { API_BASE } from './local-instance';
+import { PRODUCTS } from './test-data';
 
 /**
  * `algoliasearch` and `fetch` are mocked so the readiness and seeding tests stay
@@ -18,21 +19,37 @@ import { API_BASE } from './local-instance';
 const algoliaClient = vi.hoisted(() => ({
   calls: [] as string[],
   failures: new Set<string>(),
+  pendingTasks: new Set<number>(),
+  nextTask: 1,
+  indexName: '',
+  metadataVisible: true,
+  duplicateMetadata: false,
   record(name: string) {
     this.calls.push(name);
     if (this.failures.has(name)) {
       throw new Error(`${name} failed`);
     }
   },
+  accept(name: string, indexName: string) {
+    this.record(name);
+    this.indexName = indexName;
+    const taskID = this.nextTask++;
+    this.pendingTasks.add(taskID);
+    return { taskID };
+  },
 }));
 
 vi.mock('algoliasearch', () => ({
   algoliasearch: () => ({
-    setSettings: async () => algoliaClient.record('setSettings'),
-    saveSynonym: async () => algoliaClient.record('saveSynonym'),
-    saveRule: async () => algoliaClient.record('saveRule'),
-    saveObjects: async () => algoliaClient.record('saveObjects'),
-    deleteIndex: async () => algoliaClient.record('deleteIndex'),
+    setSettings: async ({ indexName }: { indexName: string }) => algoliaClient.accept('setSettings', indexName),
+    saveSynonym: async ({ indexName }: { indexName: string }) => algoliaClient.accept('saveSynonym', indexName),
+    saveRule: async ({ indexName }: { indexName: string }) => algoliaClient.accept('saveRule', indexName),
+    saveObjects: async ({ indexName }: { indexName: string }) => [algoliaClient.accept('saveObjects', indexName)],
+    waitForTask: async ({ taskID }: { taskID: number }) => {
+      algoliaClient.record('waitForTask');
+      if (!algoliaClient.pendingTasks.delete(taskID)) throw new Error('unknown task');
+    },
+    deleteIndex: async ({ indexName }: { indexName: string }) => algoliaClient.accept('deleteIndex', indexName),
     search: async () => {
       algoliaClient.record('search');
       return { results: [{ nbHits: Number.MAX_SAFE_INTEGER }] };
@@ -53,7 +70,10 @@ function stubCleanCredentialEnv(): void {
 function stubReadinessResponse(status: number): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn(async () => {
     algoliaClient.record('readiness');
-    return { status, ok: status === 200, json: async () => ({ indexes: [] }) } as unknown as Response;
+    const entry = { name: algoliaClient.indexName, entries: PRODUCTS.length };
+    const indexes = algoliaClient.metadataVisible && algoliaClient.indexName && !algoliaClient.pendingTasks.size
+      ? (algoliaClient.duplicateMetadata ? [entry, entry] : [entry]) : [];
+    return { status, ok: status === 200, json: async () => ({ indexes }) } as unknown as Response;
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
@@ -62,6 +82,11 @@ function stubReadinessResponse(status: number): ReturnType<typeof vi.fn> {
 beforeEach(() => {
   algoliaClient.calls.length = 0;
   algoliaClient.failures.clear();
+  algoliaClient.pendingTasks.clear();
+  algoliaClient.nextTask = 1;
+  algoliaClient.indexName = '';
+  algoliaClient.metadataVisible = true;
+  algoliaClient.duplicateMetadata = false;
 });
 
 afterEach(() => {
@@ -244,6 +269,46 @@ describe('assertAlgoliaCredentialsReady', () => {
 });
 
 describe('seedAlgoliaIndex', () => {
+  it('finishes every accepted native task before returning a migration source', async () => {
+    stubCleanCredentialEnv();
+    stubReadinessResponse(200);
+    await seedAlgoliaIndex();
+    expect(algoliaClient.pendingTasks.size).toBe(0);
+  });
+
+  it('uses the operator-owned throwaway prefix when supplied', () => {
+    vi.stubEnv('ALGOLIA_TEST_INDEX_PREFIX', 'fj_e_');
+    expect(buildAlgoliaMigrationIndexName(1700000000000, 42, 'abc-123'))
+      .toBe('fj_e_1700000000000_42_abc-123');
+  });
+
+  it('rejects a prefix outside the owned fixture namespace', () => {
+    vi.stubEnv('ALGOLIA_TEST_INDEX_PREFIX', 'unowned_');
+    expect(() => buildAlgoliaMigrationIndexName()).toThrowError(/owned fj_ namespace/);
+  });
+
+  it('propagates failed native completion and failed rollback completion', async () => {
+    stubCleanCredentialEnv();
+    stubReadinessResponse(200);
+    algoliaClient.failures.add('waitForTask');
+    await expect(seedAlgoliaIndex()).rejects.toMatchObject({
+      name: 'AggregateError',
+      errors: [
+        expect.objectContaining({ message: 'waitForTask failed' }),
+        expect.objectContaining({ message: 'waitForTask failed' }),
+      ],
+    });
+  });
+
+  it.each(['missing', 'duplicated'])('refuses %s selected metadata even when documents are searchable', async (mode) => {
+    stubCleanCredentialEnv();
+    stubReadinessResponse(200);
+    algoliaClient.metadataVisible = mode !== 'missing';
+    algoliaClient.duplicateMetadata = mode === 'duplicated';
+    await expect(seedAlgoliaIndex()).rejects.toThrowError('Algolia fixture source metadata is not ready');
+    expect(algoliaClient.calls).toContain('deleteIndex');
+  });
+
   it('includes process and random discriminators in vendor-backed index names', () => {
     expect(buildAlgoliaMigrationIndexName(1_700_000_000_000, 42, 'abc-123')).toBe(
       'fj_e2e_migrate_1700000000000_42_abc-123',

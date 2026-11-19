@@ -202,6 +202,12 @@ impl QueryExecutor {
         use std::collections::HashMap;
         use tantivy::schema::IndexRecordOption;
 
+        // No explicit ordered attributes means Algolia disables this criterion.
+        // Preserve the preceding relevance order instead of sorting ties by doc ID.
+        if self.ordered_searchable_paths().is_empty() {
+            return Ok(docs);
+        }
+
         let mut doc_positions: HashMap<(u32, u32), u32> = HashMap::with_capacity(docs.len());
         let mut candidates_by_segment = vec![Vec::new(); searcher.segment_readers().len()];
         for doc in &docs {
@@ -331,5 +337,100 @@ impl QueryExecutor {
         }
 
         Ok(min_pos)
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+    use crate::{Document, FieldValue, IndexManager};
+
+    #[tokio::test]
+    async fn recall_default_attribute_ranking_preserves_prior_relevance_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = IndexManager::new(tmp.path());
+        manager.create_tenant("ranking").unwrap();
+        manager
+            .add_documents_sync(
+                "ranking",
+                [("typo", "Jacked", 10), ("exact", "Jacket", 90)]
+                    .into_iter()
+                    .map(|(id, name, popularity)| Document {
+                        id: id.into(),
+                        fields: [
+                            ("name".into(), FieldValue::Text(name.into())),
+                            ("popularity".into(), FieldValue::Integer(popularity)),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        for generation in 0..3 {
+            let index = manager.get_or_load("ranking").unwrap();
+            let searcher = index.reader().searcher();
+            let schema = index.inner().schema();
+            if generation > 0 {
+                assert!(
+                    searcher.segment_readers().len() > 1,
+                    "cross-write fixture must span segments"
+                );
+            }
+            let id_field = schema.get_field("_id").unwrap();
+            let address = |id| {
+                searcher
+                    .search(
+                        &tantivy::query::TermQuery::new(
+                            tantivy::Term::from_field_text(id_field, id),
+                            tantivy::schema::IndexRecordOption::Basic,
+                        ),
+                        &TopDocs::with_limit(1).order_by_score(),
+                    )
+                    .unwrap()[0]
+                    .1
+            };
+            // Better preceding relevance must survive a lower doc_id. Later
+            // writes add independent segments and must not change that order.
+            let docs = vec![(9.0, address("exact")), (1.0, address("typo"))];
+            for settings in [
+                None,
+                Some(std::sync::Arc::new(
+                    crate::index::settings::IndexSettings::default(),
+                )),
+                Some(std::sync::Arc::new(crate::index::settings::IndexSettings {
+                    custom_ranking: Some(vec!["desc(popularity)".into()]),
+                    ..Default::default()
+                })),
+            ] {
+                let executor =
+                    QueryExecutor::new(index.converter(), schema.clone()).with_settings(settings);
+                assert_eq!(
+                    executor
+                        .apply_tier2_and_custom_ranking(&searcher, docs.clone(), &["jacket".into()])
+                        .unwrap(),
+                    docs
+                );
+                assert_eq!(
+                    executor
+                        .extract_min_position(&searcher, docs[0].1, &["jacket".into()])
+                        .unwrap(),
+                    u32::MAX
+                );
+            }
+            manager
+                .add_documents_sync(
+                    "ranking",
+                    vec![Document {
+                        id: format!("later{generation}"),
+                        fields: [("name".into(), FieldValue::Text("unrelated".into()))]
+                            .into_iter()
+                            .collect(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
     }
 }

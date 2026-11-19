@@ -180,9 +180,17 @@ jobs:
         env:
           ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
           ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
+      - name: Sanitize test reports
+        id: sanitize-report
+        if: always()
+        working-directory: engine/dashboard
+        run: node scripts/redact_playwright_evidence.mjs --artifact-root playwright-report-pages --artifact-root playwright-report
+        env:
+          ALGOLIA_APP_ID: ${{ secrets.ALGOLIA_APP_ID }}
+          ALGOLIA_ADMIN_KEY: ${{ secrets.ALGOLIA_ADMIN_KEY }}
       - name: Upload test reports
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
+        if: always() && steps.sanitize-report.outcome == 'success'
         with:
           name: dashboard-all-tests-report
           path: |
