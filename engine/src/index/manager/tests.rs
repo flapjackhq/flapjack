@@ -6305,12 +6305,18 @@ fn ranking_attribute_before_exact_per_algolia_default() {
         },
     ];
 
+    // Attribute precedence is enabled only with an explicit ordered list.
+    let settings = IndexSettings {
+        searchable_attributes: Some(vec!["title".into(), "description".into()]),
+        ..Default::default()
+    };
+
     sort_results_with_stage2_ranking(
         &mut all_results,
         Stage2RankingContext {
             query_text: "red",
             searchable_paths: &["title".to_string(), "description".to_string()],
-            settings: None,
+            settings: Some(&settings),
             synonym_store: None,
             plural_map: None,
             query_type: "prefixLast",
@@ -6365,6 +6371,7 @@ fn ranking_setting_can_put_exact_before_attribute() {
         },
     ];
     let settings = IndexSettings {
+        searchable_attributes: Some(vec!["title".into(), "description".into()]),
         ranking: Some(vec![
             "typo".to_string(),
             "geo".to_string(),
@@ -6441,13 +6448,17 @@ fn attribute_criteria_computed_by_min_proximity_changes_attribute_winner() {
         },
     ];
 
+    let ordered_settings = IndexSettings {
+        searchable_attributes: Some(vec!["title".into(), "description".into()]),
+        ..Default::default()
+    };
     let mut default_ranked = base_results.clone();
     sort_results_with_stage2_ranking(
         &mut default_ranked,
         Stage2RankingContext {
             query_text: "red shoes",
             searchable_paths: &["title".to_string(), "description".to_string()],
-            settings: None,
+            settings: Some(&ordered_settings),
             synonym_store: None,
             plural_map: None,
             query_type: "prefixNone",
@@ -6470,6 +6481,7 @@ fn attribute_criteria_computed_by_min_proximity_changes_attribute_winner() {
 
     let mut min_proximity_ranked = base_results;
     let settings = IndexSettings {
+        searchable_attributes: Some(vec!["title".into(), "description".into()]),
         attribute_criteria_computed_by_min_proximity: Some(true),
         ..Default::default()
     };
@@ -8493,4 +8505,249 @@ async fn tenant_quiesce_fence_acquisition_does_not_block_async_runtime() {
     let quiesce = quiesce_task.await.unwrap().unwrap();
     drop(quiesce);
     release_thread.join().unwrap();
+}
+
+async fn recall_restricted_manager(attributes: &[&str]) -> (TempDir, Arc<IndexManager>) {
+    let tmp = TempDir::new().unwrap();
+    let manager = IndexManager::new(tmp.path());
+    manager.create_tenant("restricted").unwrap();
+    let settings = crate::index::settings::IndexSettings {
+        searchable_attributes: Some(attributes.iter().map(|s| (*s).into()).collect()),
+        ..Default::default()
+    };
+    settings
+        .save(tmp.path().join("restricted/settings.json"))
+        .unwrap();
+    manager.invalidate_settings_cache("restricted");
+    (tmp, manager)
+}
+
+#[tokio::test]
+async fn recall_explicit_attributes_include_nested_parent_but_not_similar_prefix() {
+    let (_tmp, manager) = recall_restricted_manager(&["author"]).await;
+    manager
+        .add_documents_sync(
+            "restricted",
+            vec![Document {
+                id: "nested".into(),
+                fields: [
+                    (
+                        "author".into(),
+                        FieldValue::Object(
+                            [("name".into(), FieldValue::Text("Ada Lovelace".into()))]
+                                .into_iter()
+                                .collect(),
+                        ),
+                    ),
+                    ("authorship".into(), FieldValue::Text("excluded".into())),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .search("restricted", "lovelace", None, None, 10)
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(
+        manager
+            .search("restricted", "excluded", None, None, 10)
+            .unwrap()
+            .total,
+        0
+    );
+}
+
+#[tokio::test]
+async fn recall_explicit_attributes_comma_group_is_searchable_at_equal_rank() {
+    let (_tmp, manager) = recall_restricted_manager(&["title,alternate_title"]).await;
+    manager
+        .add_documents_sync(
+            "restricted",
+            vec![Document {
+                id: "grouped".into(),
+                fields: [
+                    ("title".into(), FieldValue::Text("alpine".into())),
+                    (
+                        "alternate_title".into(),
+                        FieldValue::Text("mountain".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        )
+        .await
+        .unwrap();
+    for word in ["alpine", "mountain"] {
+        assert_eq!(
+            manager
+                .search("restricted", word, None, None, 10)
+                .unwrap()
+                .total,
+            1,
+            "{word}"
+        );
+    }
+    let paths = vec!["title".into(), "alternate_title".into(), "other".into()];
+    let (selected, weights) = super::search_phases::build_searchable_paths_with_weights(
+        &paths,
+        Some(&["title,alternate_title".into()]),
+    );
+    assert_eq!(selected, ["title", "alternate_title"]);
+    assert_eq!(weights, [1.0, 1.0]);
+}
+
+#[tokio::test]
+async fn recall_explicit_attributes_do_not_fuzz_the_field_name() {
+    let (_tmp, manager) = recall_restricted_manager(&["title"]).await;
+    manager
+        .add_documents_sync(
+            "restricted",
+            vec![Document {
+                id: "excluded".into(),
+                fields: [
+                    ("title".into(), FieldValue::Text("unrelated".into())),
+                    ("titel".into(), FieldValue::Text("waterproof".into())),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        )
+        .await
+        .unwrap();
+    for word in ["waterproof", "waterprof"] {
+        assert_eq!(
+            manager
+                .search("restricted", word, None, None, 10)
+                .unwrap()
+                .total,
+            0,
+            "field-name typo leaked excluded field: {word}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_default_attribute_criterion_is_disabled_in_final_ranking() {
+    let (_tmp, manager) = recall_restricted_manager(&[]).await;
+    for (id, path, popularity) in [("z_early", "brand", 10), ("a_late", "title", 90)] {
+        manager
+            .add_documents_sync(
+                "restricted",
+                vec![Document {
+                    id: id.into(),
+                    fields: [
+                        (path.into(), FieldValue::Text("target".into())),
+                        ("popularity".into(), FieldValue::Integer(popularity)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    for custom in [None, Some(vec!["desc(popularity)".to_string()])] {
+        let mut settings = crate::index::settings::IndexSettings {
+            custom_ranking: custom,
+            ..Default::default()
+        };
+        for generation in 0..3 {
+            settings
+                .save(_tmp.path().join("restricted/settings.json"))
+                .unwrap();
+            manager.invalidate_settings_cache("restricted");
+            let result = manager
+                .search("restricted", "target", None, None, 10)
+                .unwrap();
+            assert_eq!(
+                result
+                    .documents
+                    .iter()
+                    .map(|d| d.document.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["a_late", "z_early"],
+                "default ranking after write {generation}"
+            );
+            manager
+                .add_documents_sync(
+                    "restricted",
+                    vec![Document {
+                        id: format!(
+                            "filler_{generation}_{:?}",
+                            settings.custom_ranking.is_some()
+                        ),
+                        fields: [("title".into(), FieldValue::Text("unrelated".into()))]
+                            .into_iter()
+                            .collect(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        settings.searchable_attributes = Some(vec!["brand".into(), "title".into()]);
+        settings
+            .save(_tmp.path().join("restricted/settings.json"))
+            .unwrap();
+        manager.invalidate_settings_cache("restricted");
+        let result = manager
+            .search("restricted", "target", None, None, 10)
+            .unwrap();
+        assert_eq!(
+            result.documents[0].document.id, "z_early",
+            "explicit attribute priority must still work"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_grouped_attributes_tie_before_custom_ranking() {
+    let (tmp, manager) = recall_restricted_manager(&["title,alternate_title"]).await;
+    let settings = crate::index::settings::IndexSettings {
+        searchable_attributes: Some(vec!["title,alternate_title".into()]),
+        custom_ranking: Some(vec!["desc(popularity)".into()]),
+        ..Default::default()
+    };
+    settings
+        .save(tmp.path().join("restricted/settings.json"))
+        .unwrap();
+    manager.invalidate_settings_cache("restricted");
+    for (id, path, text, popularity) in [
+        ("favorite", "title", "target alpha gap beta", 90),
+        ("other", "alternate_title", "target alpha beta", 10),
+    ] {
+        manager
+            .add_documents_sync(
+                "restricted",
+                vec![Document {
+                    id: id.into(),
+                    fields: [
+                        (path.into(), FieldValue::Text(text.into())),
+                        ("popularity".into(), FieldValue::Integer(popularity)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    for query in ["target", "alpha beta"] {
+        let result = manager.search("restricted", query, None, None, 10).unwrap();
+        assert_eq!(
+            result
+                .documents
+                .iter()
+                .map(|d| d.document.id.as_str())
+                .collect::<Vec<_>>(),
+            ["favorite", "other"],
+            "grouped attributes must tie, including position: {query}"
+        );
+    }
 }

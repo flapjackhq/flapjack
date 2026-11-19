@@ -7,6 +7,9 @@ use super::translation::{
     TranslationReportEntry,
 };
 use super::*;
+
+#[path = "meilisearch_contract_tests/searchable_attributes.rs"]
+mod searchable_attributes;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;

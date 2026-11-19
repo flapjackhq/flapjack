@@ -328,13 +328,13 @@ def build_inherited_report_mutants(
     name: Dashboard all tests
     needs: check-repo
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:""",
             """  dashboard-all:
     name: Dashboard all tests
     needs: check-repo
     if: needs.check-repo.outputs.is-public-repo == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_HTML_OUTPUT_DIR: playwright-report-pages
     steps:""",
@@ -426,6 +426,29 @@ def build_selection_mutants(tmp_dir: Path) -> list[tuple[str, dict[str, Path]]]:
     return mutants
 
 
+def build_report_sanitation_mutants(tmp_dir: Path) -> list[tuple[str, dict[str, Path]]]:
+    mutants = []
+    for workflow in ("ci", "nightly"):
+        paths = copy_inputs(tmp_dir, f"{workflow}-unsafe-upload")
+        write_text(paths[workflow], replace_once(
+            paths[workflow].read_text(encoding="utf-8"),
+            "if: always() && steps.sanitize-report.outcome == 'success'",
+            "if: always()",
+            f"{workflow} upload ignores sanitizer failure",
+        ))
+        mutants.append((f"{workflow} upload ignores sanitizer failure", paths))
+
+    paths = copy_inputs(tmp_dir, "sanitizer-masks-failure")
+    write_text(paths["ci"], replace_once(
+        paths["ci"].read_text(encoding="utf-8"),
+        "run: node scripts/redact_playwright_evidence.mjs --artifact-root playwright-report",
+        "run: node scripts/redact_playwright_evidence.mjs --artifact-root playwright-report ; true",
+        "sanitizer command masks its exit status",
+    ))
+    mutants.append(("sanitizer command masks its exit status", paths))
+    return mutants
+
+
 def build_mutants(tmp_dir: Path) -> list[tuple[str, dict[str, Path]]]:
     """Compose every independently owned mutation family."""
     builders = (
@@ -436,6 +459,7 @@ def build_mutants(tmp_dir: Path) -> list[tuple[str, dict[str, Path]]]:
         build_multi_report_command_mutants,
         build_inherited_report_mutants,
         build_selection_mutants,
+        build_report_sanitation_mutants,
     )
     return [mutant for builder in builders for mutant in builder(tmp_dir)]
 

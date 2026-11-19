@@ -538,6 +538,31 @@ function stepSelectsMigrationSpec(step, ownerProjects, specPath) {
 }
 
 const projects = parseProjects(playwrightConfig);
+for (const workflowPath of [ciWorkflowPath, nightlyWorkflowPath]) {
+  const source = fs.readFileSync(workflowPath, 'utf8');
+  for (const [, job] of source.matchAll(/^  ([a-zA-Z0-9_-]+):$/gm)) {
+    const steps = workflowJobSteps(workflowPath, job);
+    for (const [uploadIndex, upload] of steps.entries()) {
+      const text = upload.lines.join('\n');
+      if (!text.includes('actions/upload-artifact@') || !text.includes('engine/dashboard/playwright-report')) continue;
+      const sanitize = steps.slice(0, uploadIndex).find((step) => step.lines.some((line) => line.trim() === 'id: sanitize-report'));
+      const roots = [...new Set([...text.matchAll(/engine\/dashboard\/(playwright-report(?:-pages)?)/g)].map((match) => match[1]))];
+      const command = sanitize ? runCommandFromStep(sanitize) : '';
+      const tokens = tokenizeCommand(command);
+      check(Boolean(sanitize)
+        && sanitize.lines.some((line) => line.trim() === 'if: always()')
+        && sanitize.lines.some((line) => line.trim() === 'working-directory: engine/dashboard')
+        && command.startsWith('node scripts/redact_playwright_evidence.mjs ')
+        && tokens.length === 2 + roots.length * 2
+        && tokens.slice(2).every((token, index) => index % 2 === 0 ? token === '--artifact-root' : roots.includes(token))
+        && roots.every((root) => tokens.includes(root))
+        && !sanitize.lines.some((line) => /^continue-on-error:\s*(?!false\s*$)/.test(line.trim()))
+        && upload.lines.some((line) => line.trim() === "if: always() && steps.sanitize-report.outcome == 'success'")
+        && (!steps.some(stepHasAlgoliaEnv) || stepHasAlgoliaEnv(sanitize)),
+      `${path.basename(workflowPath)}:${job} admits report upload only after complete artifact sanitation`);
+    }
+  }
+}
 const migrationOwners = specOwners(projects, migrationSpec);
 const migrationOwner = migrationOwners[0];
 const apiProject = projects.find((project) => listSpecFiles(project.testDir).some((specPath) => specPath.startsWith('tests/e2e-api/')));

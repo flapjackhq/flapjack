@@ -34,11 +34,21 @@ pub(super) fn parse_ranking_criteria(settings: Option<&IndexSettings>) -> Vec<Ra
         .filter_map(|criterion| classify_ranking_criterion_token(criterion).map(ranking_criterion))
         .collect();
 
-    if criteria.is_empty() {
+    let mut criteria = if criteria.is_empty() {
         DEFAULT_RANKING_CRITERIA.to_vec()
     } else {
         criteria
+    };
+    // With all attributes searchable, Algolia disables the attribute criterion.
+    // Filter after default resolution: ranking=["attribute"] then means no
+    // builtin criteria, rather than accidentally restoring the default list.
+    if settings
+        .and_then(|s| s.searchable_attributes.as_ref())
+        .is_none_or(Vec::is_empty)
+    {
+        criteria.retain(|criterion| !matches!(criterion, RankingCriterion::Attribute));
     }
+    criteria
 }
 
 fn ranking_criterion(token: RankingCriterionToken) -> RankingCriterion {

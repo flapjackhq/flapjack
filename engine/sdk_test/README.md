@@ -7,6 +7,22 @@ Only the explicitly labeled Algolia comparison and migration scripts contact Alg
 The Algolia comparison/migration scripts additionally require `ALGOLIA_APP_ID` and
 `ALGOLIA_ADMIN_KEY` in `.secret/.env.secret`.
 
+## Algolia migrant search recall
+
+`npm run test:contract` includes `algolia_migrant_recall.js`: 27 assertions using
+`fixtures/algolia_migrant_recall.json`, a single portable dataset, A/B/C settings,
+and frozen expected values captured from the real Algolia app. The cloud journey
+copies that JSON byte-for-byte. The fixture includes reversed-key-order parity,
+late-attribute typos, long exact terms and true prefixes, ranking, facets and
+explicit searchable-attribute exclusion. No index-format changes are required.
+
+The canonical local `./s/test --sdk` and public `sdk-contract` job run the same
+checks. `node algolia_migrant_recall.js --capture` refreshes the oracle with
+repo-provided `ALGOLIA_APP_ID` / `ALGOLIA_ADMIN_KEY` held in the environment;
+it uses only unique `fj_e_` indexes and awaits deletion in cleanup. Review any
+recorded oracle deviations before accepting a fixture refresh. Normal runs
+contact only the configured Flapjack origin and report all 27 verdicts.
+
 ## Official synchronous Python client
 
 `python_client_contract_test.sh` bootstraps the test environment and runs

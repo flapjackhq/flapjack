@@ -2249,11 +2249,27 @@ async fn replication_ack_settings_only_batch_is_mutation_effective() {
         )
         .unwrap();
     assert_eq!(
-        result.total, 2,
-        "canonical search retains unlisted attributes at low weight"
+        result.total, 1,
+        "replicated searchableAttributes must exclude the unlisted description"
     );
     assert_eq!(result.documents[0].document.id, "visible");
-    let mut facet_counts = result.facets["category"]
+    // An excluded search attribute must not delete its document. An unfiltered
+    // search also retains the original proof that both existing docs got facets.
+    let all_documents = manager
+        .search_with_options(
+            tenant_id,
+            "",
+            &SearchOptions {
+                facets: Some(&facet_requests),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        all_documents.total, 2,
+        "both replicated documents remain stored"
+    );
+    let mut facet_counts = all_documents.facets["category"]
         .iter()
         .map(|count| (count.path.as_str(), count.count))
         .collect::<Vec<_>>();
@@ -2385,6 +2401,11 @@ async fn replication_ack_virtual_settings_remain_settings_only_and_redirect_sear
         .settings_override
         .as_ref()
         .expect("virtual search must use the replicated settings as an override");
+    let primary_result = state
+        .manager
+        .search_with_options(primary, "Nebula", &SearchOptions::default())
+        .unwrap();
+    assert_eq!(primary_result.total, 2);
     let result = state
         .manager
         .search_with_options(
@@ -2396,7 +2417,7 @@ async fn replication_ack_virtual_settings_remain_settings_only_and_redirect_sear
             },
         )
         .unwrap();
-    assert_eq!(result.total, 2);
+    assert_eq!(result.total, 1);
     assert_eq!(result.documents[0].document.id, "visible");
 }
 
@@ -4891,10 +4912,9 @@ async fn assert_pull_drained(primary_app: &Router, tenant_id: &str, cursor: u64)
 ///
 /// The search and facet expectations are the canonical ones from
 /// `replication_ack_settings_only_batch_is_mutation_effective`: a
-/// `searchableAttributes` of `["title"]` still matches the description hit at
-/// lower weight, so both documents are returned with the title match first,
-/// and `attributesForFaceting` must have reindexed documents that already
-/// existed when the settings arrived.
+/// `searchableAttributes` of `["title"]` excludes the description-only hit.
+/// Both documents remain available to an unfiltered query, whose facets prove
+/// `attributesForFaceting` reindexed documents that existed before the settings.
 fn assert_replicated_settings_effects(
     replica: &PullOnlyReplica,
     replica_root: &TempDir,
@@ -4932,8 +4952,8 @@ fn assert_replicated_settings_effects(
         )
         .unwrap_or_else(|error| panic!("{stage}: replica search must succeed: {error}"));
     assert_eq!(
-        result.total, 2,
-        "{stage}: canonical search retains unlisted attributes at low weight"
+        result.total, 1,
+        "{stage}: replicated searchableAttributes must exclude the unlisted description"
     );
     assert_eq!(
         result
@@ -4941,10 +4961,26 @@ fn assert_replicated_settings_effects(
             .iter()
             .map(|hit| hit.document.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["title-match", "description-match"],
-        "{stage}: the searchable title match must outrank the description match"
+        vec!["title-match"],
+        "{stage}: only the explicitly searchable title may match"
     );
-    let mut facet_counts = result.facets["category"]
+    let all_documents = replica
+        .state
+        .manager
+        .search_with_options(
+            tenant_id,
+            "",
+            &SearchOptions {
+                facets: Some(&facet_requests),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{stage}: unfiltered replica search must succeed: {error}"));
+    assert_eq!(
+        all_documents.total, 2,
+        "{stage}: both pulled documents remain stored"
+    );
+    let mut facet_counts = all_documents.facets["category"]
         .iter()
         .map(|count| (count.path.as_str(), count.count))
         .collect::<Vec<_>>();

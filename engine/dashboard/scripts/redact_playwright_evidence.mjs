@@ -1,5 +1,6 @@
-import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { chmod, lstat, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse as parseDotenv } from 'dotenv';
 
@@ -12,6 +13,7 @@ function isSensitiveFieldName(fieldName) {
   return normalized === 'authorization'
     || normalized === 'cookie'
     || normalized === 'setcookie'
+    || normalized.endsWith('appid')
     || normalized.includes('secret')
     || normalized.endsWith('apikey')
     || normalized.endsWith('adminkey')
@@ -60,20 +62,23 @@ function collectSensitiveEnvironmentValues(environment, additionalValues) {
     .sort((left, right) => right.length - left.length);
 }
 
-function redactValue(value, sensitiveValues) {
+function redactValue(value, sensitiveValues, context) {
   if (typeof value === 'string') {
     return redactSensitiveString(value, sensitiveValues);
   }
   if (Array.isArray(value)) {
-    return value.map((item) => redactValue(item, sensitiveValues));
+    return value.map((item) => redactValue(item, sensitiveValues, context));
   }
   if (!value || typeof value !== 'object') {
     return value;
   }
 
+  const sensitivePair = typeof value.name === 'string'
+    && (isSensitiveFieldName(value.name) || context === 'cookies');
   return Object.fromEntries(Object.entries(value).map(([fieldName, fieldValue]) => [
     fieldName,
-    isSensitiveFieldName(fieldName) ? REDACTED_VALUE : redactValue(fieldValue, sensitiveValues),
+    isSensitiveFieldName(fieldName) || (sensitivePair && fieldName === 'value')
+      ? REDACTED_VALUE : redactValue(fieldValue, sensitiveValues, fieldName),
   ]));
 }
 
@@ -82,6 +87,95 @@ export function redactSensitiveReportValues(value, sensitiveValues = []) {
     (left, right) => right.length - left.length,
   );
   return redactValue(value, uniqueSensitiveValues);
+}
+
+// Python owns only ZIP transport. Redaction stays in this module, and archive
+// members never become filesystem paths. Preserve names used by trace references.
+const ZIP_TRANSPORT = `
+import base64,io,json,sys,zipfile
+try:
+ p=json.load(sys.stdin)
+ with zipfile.ZipFile(io.BytesIO(base64.b64decode(p['archive']))) as z:
+  names=z.namelist()
+  if len(names)!=len(set(names)): raise ValueError()
+  if p['operation']=='read':
+   print(json.dumps({'entries':[{'name':n,'data':base64.b64encode(z.read(n)).decode()} for n in names],'comment':base64.b64encode(z.comment).decode()}))
+  else:
+   entries={e['name']:base64.b64decode(e['data']) for e in p['entries']}
+   if set(entries)!=set(names): raise ValueError()
+   output=io.BytesIO()
+   with zipfile.ZipFile(output,'w') as cleaned:
+    cleaned.comment=base64.b64decode(p['comment'])
+    for info in z.infolist(): cleaned.writestr(info,entries[info.filename])
+   print(json.dumps(base64.b64encode(output.getvalue()).decode()))
+except Exception:
+ print('ZIP artifact transport refused',file=sys.stderr)
+ sys.exit(2)
+`;
+
+function exchangeZip(payload) {
+  try {
+    return JSON.parse(execFileSync('python3', ['-c', ZIP_TRANSPORT], {
+      input: JSON.stringify(payload), encoding: 'utf8', stdio: 'pipe', maxBuffer: 64 * 1024 * 1024,
+    }));
+  } catch {
+    throw new Error('ZIP artifact could not be sanitized');
+  }
+}
+
+function redactZip(archive, sensitiveValues) {
+  const encoded = archive.toString('base64');
+  const contents = exchangeZip({ operation: 'read', archive: encoded });
+  const entries = contents.entries.map(({ name, data }) => ({
+    name,
+    data: redactArtifactBytes(Buffer.from(data, 'base64'), name, sensitiveValues).toString('base64'),
+  }));
+  const comment = redactArtifactBytes(Buffer.from(contents.comment, 'base64'), 'comment.txt', sensitiveValues).toString('base64');
+  return Buffer.from(exchangeZip({ operation: 'write', archive: encoded, entries, comment }), 'base64');
+}
+
+function redactArtifactBytes(original, name, sensitiveValues) {
+  if (name.endsWith('.zip')) return redactZip(original, sensitiveValues);
+  if (/\.(?:png|jpe?g|webp|gif|woff2?|wasm|js|css)$/.test(name)) {
+    if (sensitiveValues.some((value) => original.includes(Buffer.from(value)))) {
+      throw new Error('Static artifact contains sensitive data');
+    }
+    return original;
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf8', { fatal: true }).decode(original);
+  } catch {
+    if (sensitiveValues.some((value) => original.includes(Buffer.from(value)))) {
+      throw new Error('Binary artifact contains sensitive data');
+    }
+    return original;
+  }
+  if (name.endsWith('.html')) {
+    text = text.replace(/data:application\/zip;base64,([A-Za-z0-9+/=]+)/g, (_, encoded) => (
+      `data:application/zip;base64,${redactZip(Buffer.from(encoded, 'base64'), sensitiveValues).toString('base64')}`
+    ));
+    // The HTML also carries static viewer code; keep its token definitions intact.
+    for (const value of sensitiveValues) text = text.replaceAll(value, REDACTED_VALUE);
+    return Buffer.from(text);
+  }
+  if (/\.(?:trace|network|jsonl)$/.test(name)) {
+    try {
+      return Buffer.from(text.split('\n').map((line) => (
+        line ? JSON.stringify(redactSensitiveReportValues(JSON.parse(line), sensitiveValues)) : line
+      )).join('\n'));
+    } catch {
+      throw new Error('Structured trace artifact is malformed');
+    }
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    if (name.endsWith('.json')) throw new Error('JSON artifact is malformed');
+    return Buffer.from(redactSensitiveString(text, sensitiveValues));
+  }
+  return Buffer.from(JSON.stringify(redactSensitiveReportValues(parsed, sensitiveValues), null, 2));
 }
 
 async function rewriteEvidenceFile(inputFile, content) {
@@ -98,24 +192,28 @@ async function rewriteEvidenceFile(inputFile, content) {
 
 export async function redactEvidenceFile(inputFile, options = {}) {
   const resolvedInputFile = resolve(inputFile);
-  const original = await readFile(resolvedInputFile, 'utf8');
+  const original = await readFile(resolvedInputFile);
   const sensitiveValues = collectSensitiveEnvironmentValues(
     options.environment ?? process.env,
     options.sensitiveValues ?? [],
   );
-  let redacted;
-
-  try {
-    const report = JSON.parse(original);
-    redacted = JSON.stringify(redactSensitiveReportValues(report, sensitiveValues), null, 2);
-  } catch (error) {
-    if (options.requireJson) {
-      throw error;
-    }
-    redacted = redactSensitiveString(original, sensitiveValues);
-  }
+  const redacted = options.requireJson
+    ? JSON.stringify(redactSensitiveReportValues(JSON.parse(original.toString('utf8')), sensitiveValues), null, 2)
+    : redactArtifactBytes(original, resolvedInputFile, sensitiveValues);
 
   await rewriteEvidenceFile(resolvedInputFile, redacted);
+}
+
+export async function redactArtifactDirectory(root, options = {}) {
+  const info = await lstat(root);
+  if (info.isSymbolicLink()) throw new Error('Artifact links are not accepted');
+  if (!info.isDirectory()) {
+    await redactEvidenceFile(root, options);
+    return;
+  }
+  for (const entry of await readdir(root)) {
+    await redactArtifactDirectory(join(root, entry), options);
+  }
 }
 
 export default class RedactPlaywrightJsonReporter {
@@ -145,17 +243,21 @@ export default class RedactPlaywrightJsonReporter {
 
 async function runCli(args) {
   const files = [];
+  const artifactRoots = [];
   let secretFile;
 
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === '--secret-file') {
       secretFile = args[index + 1];
       index += 1;
+    } else if (args[index] === '--artifact-root') {
+      artifactRoots.push(args[index + 1]);
+      index += 1;
     } else {
       files.push(args[index]);
     }
   }
-  if (files.length === 0) {
+  if (files.length === 0 && artifactRoots.length === 0) {
     throw new Error('usage: redact_playwright_evidence.mjs [--secret-file path] <file> [...]');
   }
 
@@ -165,6 +267,9 @@ async function runCli(args) {
   }
   for (const file of files) {
     await redactEvidenceFile(file, { sensitiveValues });
+  }
+  for (const root of artifactRoots) {
+    await redactArtifactDirectory(resolve(root), { sensitiveValues });
   }
 }
 

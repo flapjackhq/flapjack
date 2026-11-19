@@ -167,7 +167,6 @@ struct FieldQueryContext<'a> {
     is_prefix: bool,
     target_field: tantivy::schema::Field,
     json_search_field: tantivy::schema::Field,
-    max_fuzzy_paths: usize,
     plural_forms: &'a [String],
 }
 
