@@ -49,6 +49,7 @@ mod typesense_field_validation_tests;
 mod typesense_source_reader;
 
 use super::AppState;
+use crate::api_profile::ApiProfile;
 use crate::auth::AuthenticatedAppId;
 use crate::error_response::{json_error_parts, json_error_parts_with_code};
 use algolia_client::{AlgoliaClient, AlgoliaClientError, AlgoliaErrorKind, AlgoliaIndexRecord};
@@ -875,9 +876,13 @@ impl AsyncMigrationSubmitPayload for MigrateFromTypesenseRequest {
 )]
 pub async fn migrate_from_algolia(
     State(state): State<Arc<AppState>>,
+    Extension(profile): Extension<ApiProfile>,
     Json(payload): Json<MigrateFromAlgoliaRequest>,
 ) -> Result<Json<MigrateFromAlgoliaResponse>, MigrateError> {
-    migrate_from_algolia_impl(state, payload, algolia_source_reader).await
+    migrate_from_algolia_impl(state, payload, |payload| {
+        algolia_source_reader_for_profile(payload, profile)
+    })
+    .await
 }
 
 macro_rules! define_source_migration_openapi_lifecycle {
@@ -1342,6 +1347,7 @@ fn typesense_discovery_client(
 }
 
 pub(crate) async fn preview_algolia_migration_http(
+    Extension(profile): Extension<ApiProfile>,
     source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
     #[cfg(test)] test_source_factory: Option<Extension<TestMigrationSourceReaderFactory>>,
     body: Bytes,
@@ -1361,7 +1367,10 @@ pub(crate) async fn preview_algolia_migration_http(
                 })
                 .await;
             }
-            preview_source_migration(source_provider, payload, algolia_source_reader).await
+            preview_source_migration(source_provider, payload, |payload| {
+                algolia_source_reader_for_profile(payload, profile)
+            })
+            .await
         }
         AsyncMigrationSourceProvider::Meilisearch => {
             let payload = parse_submit_payload(&body)?;
@@ -1392,6 +1401,7 @@ pub(crate) async fn preview_algolia_migration_http(
 
 pub(crate) async fn submit_algolia_migration_http(
     State(state): State<Arc<AppState>>,
+    Extension(profile): Extension<ApiProfile>,
     Extension(AuthenticatedAppId(authenticated_app_id)): Extension<AuthenticatedAppId>,
     Extension(mutation_permit): Extension<crate::pause_registry::MutationPermit>,
     source_provider: Option<Extension<AsyncMigrationSourceProvider>>,
@@ -1423,7 +1433,7 @@ pub(crate) async fn submit_algolia_migration_http(
                 state,
                 owner,
                 payload,
-                algolia_source_reader,
+                |payload| algolia_source_reader_for_profile(payload, profile),
                 mutation_permit,
             )
             .await
@@ -1485,10 +1495,12 @@ pub(crate) async fn resume_algolia_migration_http(
         Extension(AuthenticatedAppId(authenticated_app_id)),
         Extension(mutation_permit),
         source_provider,
+        Extension(profile),
     ): (
         Extension<AuthenticatedAppId>,
         Extension<crate::pause_registry::MutationPermit>,
         Option<Extension<AsyncMigrationSourceProvider>>,
+        Extension<ApiProfile>,
     ),
     #[cfg(test)] test_source_factory: Option<Extension<TestMigrationSourceReaderFactory>>,
     headers: HeaderMap,
@@ -1520,7 +1532,7 @@ pub(crate) async fn resume_algolia_migration_http(
         source_provider,
         job_id,
         payload,
-        algolia_source_reader,
+        |payload| algolia_source_reader_for_profile(payload, profile),
         mutation_permit,
     )
     .await
@@ -2072,6 +2084,13 @@ fn admit_source_migration_target(
         target_index: target_index.to_string(),
         publication_mode: MigrationPublicationMode::CreateOnly,
     })
+}
+
+fn algolia_source_reader_for_profile(
+    payload: &MigrateFromAlgoliaRequest,
+    profile: ApiProfile,
+) -> Result<source_reader::AlgoliaSourceReader, AlgoliaClientError> {
+    algolia_source_reader(payload).map(|reader| reader.with_profile(profile))
 }
 
 fn algolia_source_reader(
@@ -2810,6 +2829,7 @@ mod tests {
         let state = TestStateBuilder::new(&tmp).build_shared();
         let migrate_error = migrate_from_algolia(
             State(state),
+            Extension(ApiProfile::Full),
             Json(MigrateFromAlgoliaRequest {
                 app_id: String::new(),
                 api_key: String::new(),

@@ -223,7 +223,7 @@ pub(super) fn optional_filter_score_for_document(
 /// * `documents` - Documents to rerank and paginate
 /// * `groups` - Groups of (field, value, score) filter criteria
 /// * `sum_or_filters_scores` - If true, sum matching scores per group; if false, take the maximum
-/// * `page` - Zero-based page number
+/// * `offset` - Zero-based result position
 /// * `hits_per_page` - Number of results per page
 ///
 /// # Returns
@@ -233,7 +233,7 @@ pub(super) fn rerank_documents_by_optional_filters(
     documents: Vec<ScoredDocument>,
     groups: &[Vec<(String, String, f32)>],
     sum_or_filters_scores: bool,
-    page: usize,
+    offset: usize,
     hits_per_page: usize,
 ) -> Vec<ScoredDocument> {
     let mut ranked: Vec<(usize, f32, ScoredDocument)> = documents
@@ -253,7 +253,7 @@ pub(super) fn rerank_documents_by_optional_filters(
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    let start = page.saturating_mul(hits_per_page).min(ranked.len());
+    let start = offset.min(ranked.len());
     ranked
         .into_iter()
         .skip(start)

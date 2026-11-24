@@ -7,6 +7,7 @@ use super::source_reader::{
     SourceObservation,
 };
 use super::AsyncMigrationSourceProvider;
+use crate::api_profile::ApiProfile;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -18,6 +19,7 @@ pub(super) struct AlgoliaSourceReader {
     /// The primary settings captured during this pass, retained so the replica
     /// list is resolved from the value already emitted rather than a second read.
     captured_primary_settings: Option<Value>,
+    strip_replicas: bool,
 }
 
 impl AlgoliaSourceReader {
@@ -32,7 +34,33 @@ impl AlgoliaSourceReader {
             source_name: source_name.to_string(),
             client,
             captured_primary_settings: None,
+            strip_replicas: false,
         })
+    }
+
+    pub(super) fn with_profile(mut self, profile: ApiProfile) -> Self {
+        self.strip_replicas = profile != ApiProfile::Full;
+        self
+    }
+
+    pub(super) fn capture_primary_settings(
+        &mut self,
+        mut settings: Value,
+    ) -> SourceConfigurationArtifact {
+        // Hosted physical index names belong to tenants. Source replica names
+        // must never reach either the emitted settings or the derived reads.
+        if self.strip_replicas
+            && settings
+                .as_object_mut()
+                .is_some_and(|value| value.remove("replicas").is_some())
+        {
+            tracing::warn!("Algolia replica topology omitted from hosted import");
+        }
+        let artifact = SourceConfigurationArtifact::settings(&settings);
+        if let SourceConfigurationArtifact::Settings { payload } = &artifact {
+            self.captured_primary_settings = Some(payload.clone());
+        }
+        artifact
     }
 }
 
@@ -84,10 +112,7 @@ impl MigrationSourceReader for AlgoliaSourceReader {
         Box::pin(async move {
             let settings = self.client.settings().await?;
             self.client.require_unretrievable_access(&settings).await?;
-            let artifact = SourceConfigurationArtifact::settings(&settings);
-            if let SourceConfigurationArtifact::Settings { payload } = &artifact {
-                self.captured_primary_settings = Some(payload.clone());
-            }
+            let artifact = self.capture_primary_settings(settings);
             consume(artifact)?;
             read_algolia_hit_configuration(
                 &mut self.client,

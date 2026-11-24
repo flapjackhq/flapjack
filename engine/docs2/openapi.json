@@ -11755,6 +11755,13 @@
           },
           "insideBoundingBox": {},
           "insidePolygon": {},
+          "length": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
           "maxFacetHits": {
             "type": [
               "integer",
@@ -11806,6 +11813,13 @@
             }
           },
           "numericFilters": {},
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
           "optionalFilters": {},
           "page": {
             "type": "integer",
@@ -12105,6 +12119,13 @@
               "type": "string"
             }
           },
+          "length": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
           "message": {
             "type": [
               "string",
@@ -12120,6 +12141,13 @@
             "minimum": 0
           },
           "nbSortedHits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "offset": {
             "type": [
               "integer",
               "null"

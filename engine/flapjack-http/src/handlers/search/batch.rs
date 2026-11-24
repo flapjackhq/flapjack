@@ -76,6 +76,8 @@ fn normalize_request_for_federation(
     // Federated ranking always starts from each query's top results. Ignore
     // per-query responseFields because the merge path requires hits + nbHits.
     request.page = 0;
+    request.offset = None;
+    request.length = None;
     request.hits_per_page = Some(federation_fetch_hits_per_page(federation, hits_cap));
     request.response_fields = None;
 }
