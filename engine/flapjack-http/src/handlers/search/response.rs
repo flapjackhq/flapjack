@@ -459,6 +459,10 @@ pub(super) fn format_search_response(
         }
     });
 
+    if let Some(offset) = req.offset {
+        response["offset"] = serde_json::json!(offset);
+        response["length"] = serde_json::json!(hits_per_page);
+    }
     if req.facets.is_some() {
         response["exhaustive"]["facetsCount"] = serde_json::json!(true);
     }

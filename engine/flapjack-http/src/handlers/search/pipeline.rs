@@ -58,9 +58,9 @@ pub(super) struct SearchPhaseWitness {
     _private: (),
 }
 
-pub(super) fn hybrid_fetch_window(hits_per_page: usize, page: usize) -> usize {
+pub(super) fn hybrid_fetch_window(hits_per_page: usize, offset: usize) -> usize {
     hits_per_page
-        .saturating_mul(page.saturating_add(1))
+        .saturating_add(offset)
         .saturating_add(HYBRID_FETCH_WINDOW_BUFFER)
         .max(HYBRID_FETCH_WINDOW_MIN)
 }

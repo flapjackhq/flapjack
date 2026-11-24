@@ -1415,6 +1415,48 @@ mod content_hash_and_idempotency {
         // index ⇒ upsert at storage layer, not a duplicate row.
     }
 
+    // Algolia saveObject examples supply objectID in the POST body:
+    // https://www.algolia.com/doc/rest-api/search/save-object
+    #[tokio::test]
+    async fn test_auto_id_post_preserves_supplied_objectid_and_upserts() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_write_guard_state(&tmp);
+        let app = make_app(state.clone());
+        for title in ["first", "updated"] {
+            let (status, response) = post_auto_id(
+                &app,
+                "supplied_idx",
+                json!({"objectID":"supplied-id", "id":"other-id", "title":title}),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(response["objectID"], "supplied-id");
+        }
+        assert!(
+            state
+                .manager
+                .wait_for_pending_tasks(std::time::Duration::from_secs(5))
+                .await
+        );
+        let doc = state
+            .manager
+            .get_document("supplied_idx", "supplied-id")
+            .unwrap()
+            .expect("record stored under supplied ID");
+        assert_eq!(
+            doc.fields.get("title"),
+            Some(&FieldValue::Text("updated".into()))
+        );
+        assert_eq!(index_document_count(&state, "supplied_idx"), 1);
+        assert!(state
+            .manager
+            .get_document("supplied_idx", "other-id")
+            .unwrap()
+            .is_none());
+    }
+
     /// Distinct bodies must produce distinct objectIDs.
     #[tokio::test]
     async fn test_auto_id_different_body_different_objectid() {

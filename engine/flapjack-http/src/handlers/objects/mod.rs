@@ -980,11 +980,13 @@ pub async fn add_record_auto_id(
     state.manager.create_tenant(&index_name)?;
     check_record_size(&body)?;
 
-    body.remove("objectID");
+    let explicit_id = body
+        .remove("objectID")
+        .and_then(|value| value.as_str().map(String::from));
     body.remove("id");
 
-    // Content-hash auto-ID: same body → same ID → client retry is a safe upsert.
-    let generated_id = auto_id_from_body(body.iter());
+    // Preserve the supplied ID; content hashing keeps ID-less retries safe.
+    let generated_id = explicit_id.unwrap_or_else(|| auto_id_from_body(body.iter()));
 
     let mut json_obj = serde_json::Map::new();
     json_obj.insert(

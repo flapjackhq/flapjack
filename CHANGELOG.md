@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.19] - 2026-11-24
+
+### Fixed
+
+- Single-record `addObject`/`saveObject` requests preserve a supplied body `objectID`.
+- Numeric filter inequalities preserve exact integer and decimal boundaries.
+- Negative `facetFilters` and escaped leading minus signs match Algolia semantics.
+- Search requests honor `offset` and `length` pagination parameters and defaults.
+- Classic clients can submit the camelCase `oneWaySynonym` synonym type.
+- Hosted Algolia imports omit source replica topology before settings publication and replica reads.
+
+### Changed
+
+- Routine aarch64 upgrades bind to the published v1.0.18 release artifact; existing data directories are preserved.
+
 ## [1.0.18] - 2026-11-18
 
 ### Fixed

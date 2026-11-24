@@ -113,7 +113,7 @@ struct InterleavingRequest<'a> {
 struct InterleavingPage<'a> {
     interleave_k: usize,
     hits_per_page: usize,
-    page: usize,
+    offset: usize,
     assignment_query_id: &'a str,
 }
 
@@ -186,7 +186,7 @@ fn apply_hybrid_fetch_window(
 ) {
     params.is_hybrid_active = hybrid_inputs.is_hybrid_active();
     if params.is_hybrid_active {
-        params.fetch_limit = hybrid_fetch_window(params.hits_per_page, req.page);
+        params.fetch_limit = hybrid_fetch_window(params.hits_per_page, req.pagination_offset());
         params.fetch_offset = 0;
     }
 }
@@ -255,7 +255,7 @@ fn build_interleaved_result(
         .collect();
 
     let total_interleaved = interleaved_docs_with_team.len();
-    let page_start = (page.page * page.hits_per_page).min(total_interleaved);
+    let page_start = page.offset.min(total_interleaved);
     let page_end = (page_start + page.hits_per_page).min(total_interleaved);
     let page_slice = &interleaved_docs_with_team[page_start..page_end];
 
@@ -307,7 +307,7 @@ fn run_interleaved_search(
                 InterleavingPage {
                     interleave_k,
                     hits_per_page: invocation.params.hits_per_page,
-                    page: invocation.req.page,
+                    offset: invocation.req.pagination_offset(),
                     assignment_query_id: request.assignment_query_id,
                 },
                 experiment_ctx.as_mut(),
@@ -396,8 +396,7 @@ fn rerun_search_for_rule_geo(
         return Ok(result);
     }
 
-    let geo_fetch_limit = (invocation.params.hits_per_page
-        + invocation.req.page * invocation.params.hits_per_page)
+    let geo_fetch_limit = (invocation.params.hits_per_page + invocation.req.pagination_offset())
         .saturating_mul(10)
         .max(1000);
     result = invocation.run(effective_index, geo_fetch_limit, 0)?;

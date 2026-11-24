@@ -1595,3 +1595,74 @@ fn expected_version_name(version: SourceIdentityVersion) -> &'static str {
         SourceIdentityVersion::V2 => "v2",
     }
 }
+
+#[tokio::test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+async fn hosted_algolia_capture_omits_replica_values_and_derived_reads() {
+    use crate::api_profile::ApiProfile;
+    let _resolver = install_test_algolia_validation_resolver(
+        "APPID",
+        Some(vec![TEST_VETTED_ALGOLIA_IP]),
+        |_host, _port| {},
+    );
+    for profile in [
+        ApiProfile::PaidBetaV1,
+        ApiProfile::PaidBetaV3,
+        ApiProfile::PaidBetaV4,
+        ApiProfile::PaidBetaV5,
+    ] {
+        for replicas in [
+            Value::Null,
+            json!([]),
+            json!(["other_customer_private_index"]),
+            json!("malformed"),
+            json!({"foreign":"index"}),
+        ] {
+            let mut reader = AlgoliaSourceReader::new("APPID", "source-key", "products")
+                .unwrap()
+                .with_profile(profile);
+            let artifact = reader.capture_primary_settings(json!({"searchableAttributes":["title"],"customSetting":{"kept":true},"replicas":replicas}));
+            let SourceConfigurationArtifact::Settings { payload } = artifact else {
+                panic!("expected settings artifact")
+            };
+            assert_eq!(
+                payload,
+                json!({"searchableAttributes":["title"],"customSetting":{"kept":true}})
+            );
+            let mut derived = Vec::new();
+            let mut consume = |artifact| {
+                derived.push(artifact);
+                Ok(())
+            };
+            reader
+                .read_derived_configuration(&mut consume)
+                .await
+                .unwrap();
+            assert!(
+                derived.is_empty(),
+                "hosted captured settings must produce no replica reads"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+fn full_algolia_capture_preserves_replica_topology() {
+    use crate::api_profile::ApiProfile;
+    let _resolver = install_test_algolia_validation_resolver(
+        "APPID",
+        Some(vec![TEST_VETTED_ALGOLIA_IP]),
+        |_host, _port| {},
+    );
+    let settings = json!({"searchableAttributes":["title"],"replicas":["products_price_asc","virtual(products_price_desc)"]});
+    let mut reader = AlgoliaSourceReader::new("APPID", "source-key", "products")
+        .unwrap()
+        .with_profile(ApiProfile::Full);
+    let SourceConfigurationArtifact::Settings { payload } =
+        reader.capture_primary_settings(settings.clone())
+    else {
+        panic!("expected settings artifact")
+    };
+    assert_eq!(payload, settings);
+}

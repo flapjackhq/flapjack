@@ -11,15 +11,25 @@ pub fn parse_facet_filter_string(s: &str) -> Option<Filter> {
     };
     let colon_pos = s.find(':')?;
     let field = s[..colon_pos].to_string();
-    let value = s[colon_pos + 1..]
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
+    let value = &s[colon_pos + 1..];
+    let (value_negated, value) = if let Some(value) = value.strip_prefix('-') {
+        (true, value)
+    } else {
+        (
+            false,
+            if value.starts_with("\\-") {
+                &value[1..]
+            } else {
+                value
+            },
+        )
+    };
+    let value = value.trim_matches('"').trim_matches('\'').to_string();
     let filter = Filter::Equals {
         field,
         value: FieldValue::Text(value),
     };
-    if negated {
+    if negated || value_negated {
         Some(Filter::Not(Box::new(filter)))
     } else {
         Some(filter)
@@ -401,5 +411,49 @@ mod tests {
         let specs = parse_optional_filters(&json!("-brand:Nike<score= 3 >"));
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0], ("brand".to_string(), "Nike".to_string(), -3.0));
+    }
+}
+
+#[cfg(test)]
+mod negative_facet_tests {
+    use super::*;
+    use crate::{index::Index, query::filter::FilterCompiler};
+    use serde_json::json;
+    use tantivy::collector::Count;
+
+    // https://www.algolia.com/doc/api-reference/api-parameters/facetFilters
+    #[test]
+    fn negative_facet_filters_and_escaped_minus_match_documents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = Index::create_in_dir(tmp.path()).unwrap();
+        index
+            .add_documents_simple(&[
+                json!({"objectID":"a", "brand":"Apple"}),
+                json!({"objectID":"b", "brand":"Samsung"}),
+                json!({"objectID":"c", "brand":"-Apple"}),
+                json!({"objectID":"d", "brand":["Apple", "Other"]}),
+                json!({"objectID":"e", "title":"missing brand"}),
+            ])
+            .unwrap();
+        let settings = crate::index::settings::IndexSettings {
+            attributes_for_faceting: vec!["brand".into()],
+            ..Default::default()
+        };
+        let compiler = FilterCompiler::new(index.schema().to_tantivy());
+        let reader = index.reader();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        for (spec, expected) in [
+            (json!(["brand:-Apple"]), 3),
+            (json!("brand:\\-Apple"), 1),
+            (json!(["brand:-Apple", "brand:Samsung"]), 1),
+            (json!([["brand:-Apple", "brand:Apple"]]), 5),
+            (json!("brand:-Samsung"), 4),
+            (json!("-brand:Apple"), 3), // retain legacy spelling
+        ] {
+            let filter = facet_filters_to_ast(&spec).unwrap();
+            let query = compiler.compile(&filter, Some(&settings)).unwrap();
+            assert_eq!(searcher.search(&query, &Count).unwrap(), expected, "{spec}");
+        }
     }
 }

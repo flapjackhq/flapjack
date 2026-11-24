@@ -227,7 +227,7 @@ async fn batch_search_federation_ignores_per_query_page_and_hits_per_page() {
         json!({
             "federation": {"limit": 3},
             "requests": [
-                {"indexName": "fed_window_alpha", "query": "window", "page": 1, "hitsPerPage": 1},
+                {"indexName": "fed_window_alpha", "query": "window", "page": 1, "hitsPerPage": 1, "offset": 2, "length": 0},
                 {"indexName": "fed_window_beta", "query": "window"}
             ]
         }),

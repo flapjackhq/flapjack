@@ -203,43 +203,108 @@ fn equals_and_not_equals_date_use_same_range_format() {
 // ── gt/lt edge cases ────────────────────────────────────────────────
 
 #[test]
-fn gt_float_unsupported() {
+fn gt_float_uses_exclusive_bound() {
     let c = make_compiler();
     let f = Filter::GreaterThan {
         field: "price".into(),
         value: FieldValue::Float(10.5),
     };
-    assert!(c.to_query_string(&f).is_err());
+    assert_eq!(
+        c.to_query_string(&f).unwrap(),
+        "_json_filter.price:{10.5 TO *]"
+    );
 }
 
 #[test]
-fn lt_float_unsupported() {
+fn lt_float_uses_exclusive_bound() {
     let c = make_compiler();
     let f = Filter::LessThan {
         field: "price".into(),
         value: FieldValue::Float(10.5),
     };
-    assert!(c.to_query_string(&f).is_err());
+    assert_eq!(
+        c.to_query_string(&f).unwrap(),
+        "_json_filter.price:[* TO 10.5}"
+    );
 }
 
 #[test]
-fn gt_integer_adds_one() {
+fn gt_integer_uses_exclusive_bound() {
     let c = make_compiler();
     let f = Filter::GreaterThan {
         field: "age".into(),
         value: FieldValue::Integer(18),
     };
     let qs = c.to_query_string(&f).unwrap();
-    assert_eq!(qs, "_json_filter.age:[19 TO *]");
+    assert_eq!(qs, "_json_filter.age:{18 TO *]");
 }
 
 #[test]
-fn lt_integer_subtracts_one() {
+fn lt_integer_uses_exclusive_bound() {
     let c = make_compiler();
     let f = Filter::LessThan {
         field: "age".into(),
         value: FieldValue::Integer(65),
     };
     let qs = c.to_query_string(&f).unwrap();
-    assert_eq!(qs, "_json_filter.age:[* TO 64]");
+    assert_eq!(qs, "_json_filter.age:[* TO 65}");
+}
+
+// https://www.algolia.com/doc/api-reference/api-parameters/numericFilters
+// Comparisons must apply to the value, regardless of the bound's JSON number type.
+#[test]
+fn numeric_inequalities_match_exact_mixed_integer_and_float_values() {
+    use crate::index::Index;
+    use crate::query::algolia_filters::parse_numeric_filter_string;
+    use serde_json::json;
+    use tantivy::collector::Count;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let index = Index::create_in_dir(tmp.path()).unwrap();
+    index
+        .add_documents_simple(&[
+            json!({"objectID":"negative", "rating":-4.5}),
+            json!({"objectID":"four", "rating":4}),
+            json!({"objectID":"below", "rating":4.499}),
+            json!({"objectID":"half", "rating":4.5}),
+            json!({"objectID":"above", "rating":4.501}),
+            json!({"objectID":"five", "rating":5}),
+        ])
+        .unwrap();
+    let compiler = FilterCompiler::new(index.schema().to_tantivy());
+    let reader = index.reader();
+    reader.reload().unwrap();
+    let searcher = reader.searcher();
+    for (expression, expected) in [
+        ("rating > 4", 4),
+        ("rating < 5", 5),
+        ("rating >= 4", 5),
+        ("rating <= 5", 6),
+        ("rating > 4.4", 4),
+        ("rating < 4.4", 2),
+        ("rating > 4.5", 2),
+        ("rating < 4.5", 3),
+        ("rating >= 4.5", 3),
+        ("rating <= 4.5", 4),
+        ("rating > -4.5", 5),
+        ("rating <= -4.5", 1),
+        ("rating > 9223372036854775807", 0),
+        ("rating < -9223372036854775808", 0),
+    ] {
+        let filter = parse_numeric_filter_string(expression).unwrap();
+        let query = compiler.compile(&filter, None).unwrap();
+        assert_eq!(
+            searcher.search(&query, &Count).unwrap(),
+            expected,
+            "{expression}"
+        );
+        let negated = compiler
+            .compile(&Filter::Not(Box::new(filter)), None)
+            .unwrap();
+        assert_eq!(
+            searcher.search(&negated, &Count).unwrap(),
+            6 - expected,
+            "NOT {expression}"
+        );
+    }
 }

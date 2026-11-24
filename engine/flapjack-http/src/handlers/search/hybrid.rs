@@ -55,7 +55,7 @@ pub(super) struct HybridFusionContext<'a> {
     pub(super) effective_index: &'a str,
     pub(super) hybrid_inputs: HybridSearchInputs<'a>,
     pub(super) hits_per_page: usize,
-    pub(super) page: usize,
+    pub(super) offset: usize,
     pub(super) is_interleaving: bool,
     pub(super) pagination_limited_exceeded: bool,
 }
@@ -93,7 +93,7 @@ fn fuse_hybrid_search_results(
     vector_results: &[flapjack::vector::VectorSearchResult],
     semantic_ratio: f64,
     hits_per_page: usize,
-    page: usize,
+    offset: usize,
 ) {
     let bm25_ids: Vec<String> = result
         .documents
@@ -102,7 +102,7 @@ fn fuse_hybrid_search_results(
         .collect();
     let fused_results = crate::fusion::rrf_fuse(&bm25_ids, vector_results, semantic_ratio, 60);
     let fused_documents = build_fused_documents(state, effective_index, result, &fused_results);
-    replace_with_fused_page(result, fused_documents, hits_per_page, page);
+    replace_with_fused_page(result, fused_documents, hits_per_page, offset);
 }
 
 /// Builds the fused document list by matching RRF-ranked IDs to BM25 hits or
@@ -186,10 +186,10 @@ fn replace_with_fused_page(
     result: &mut SearchResult,
     fused_documents: Vec<flapjack::types::ScoredDocument>,
     hits_per_page: usize,
-    page: usize,
+    offset: usize,
 ) {
     let total_fused = fused_documents.len();
-    let page_start = page.saturating_mul(hits_per_page).min(total_fused);
+    let page_start = offset.min(total_fused);
     let page_end = page_start.saturating_add(hits_per_page).min(total_fused);
     result.documents = fused_documents[page_start..page_end].to_vec();
     result.total = total_fused;
@@ -222,7 +222,7 @@ pub(super) fn hybrid_vector_results(
         return Err(hybrid_fallback_message("vector index is empty"));
     }
 
-    let vector_fetch_limit = hybrid_fetch_window(context.hits_per_page, context.page);
+    let vector_fetch_limit = hybrid_fetch_window(context.hits_per_page, context.offset);
     vector_index_guard
         .search(query_vector, vector_fetch_limit)
         .map_err(|error| {
@@ -385,7 +385,7 @@ pub(super) fn apply_hybrid_fusion(
         &vector_results,
         hybrid_params.semantic_ratio,
         context.hits_per_page,
-        context.page,
+        context.offset,
     );
     None
 }

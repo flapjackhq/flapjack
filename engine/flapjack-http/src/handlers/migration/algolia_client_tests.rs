@@ -3141,6 +3141,10 @@ fn expected_resolver_hook_symbols_by_owner(
         ),
         ("flapjack-http/src/handlers/migration/mod.rs", &[6]),
         (
+            "flapjack-http/src/handlers/migration/preview_tests.rs",
+            &[6],
+        ),
+        (
             "flapjack-http/src/handlers/migration/preview_tests/meilisearch.rs",
             &[0],
         ),
