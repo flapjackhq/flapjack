@@ -1948,6 +1948,9 @@ async fn acknowledge_source_migration(
         ));
     }
     verify_async_migration_ack_generation(&state, &spool, job_uuid, &phase_record)?;
+    spool
+        .delete_job_if_terminal(job_uuid)
+        .map_err(migration_status_spool_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

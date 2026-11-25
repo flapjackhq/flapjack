@@ -70,7 +70,7 @@ fn seed_migration_spool_gc_probe_fixture() {
         AdmissionKind::Async,
         ProbePhase {
             phase: MigrationPhase::Activating,
-            disposition: MigrationDisposition::Succeeded,
+            disposition: MigrationDisposition::Failed,
             terminal_at: Some(retained_terminal_at),
         },
     );
