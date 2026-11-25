@@ -1862,7 +1862,7 @@ fn garbage_collection_keeps_tombstone_and_does_not_scan_unregistered_paths() {
 }
 
 #[test]
-fn garbage_collection_reclaims_only_terminal_payloads_after_retention() {
+fn garbage_collection_reclaims_succeeded_payload_immediately_and_other_terminal_after_retention() {
     let tmp = TempDir::new().unwrap();
     let mut limits = test_limits();
     limits.max_staged_artifacts = 8;
@@ -1872,7 +1872,7 @@ fn garbage_collection_reclaims_only_terminal_payloads_after_retention() {
         (
             uuid::Uuid::from_u128(0x10000000000000000000000000000001),
             MigrationDisposition::Succeeded,
-            now - chrono::Duration::seconds(limits.retention_seconds),
+            now,
         ),
         (
             uuid::Uuid::from_u128(0x10000000000000000000000000000002),

@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.20] - 2026-11-25
+
+### Fixed
+
+- Acknowledging a terminal source import removes its retained job directory after validation.
+- Storage maintenance retries successful import payload cleanup without waiting for retention.
+
 ## [1.0.19] - 2026-11-24
 
 ### Fixed

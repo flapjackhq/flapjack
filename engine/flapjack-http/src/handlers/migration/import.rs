@@ -616,7 +616,15 @@ async fn import_accepted_export_inner(
     spool
         .succeed_migration(job_uuid, None)
         .map_err(spool_error)?;
-    let _ = spool.delete_export_artifacts(export.job_uuid, &export.source_identity_digest);
+    match spool.delete_export_artifacts(export.job_uuid, &export.source_identity_digest) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(%job_uuid, "import export cleanup identity mismatch; maintenance will retry")
+        }
+        Err(error) => {
+            tracing::warn!(%job_uuid, %error, "import export cleanup failed; maintenance will retry")
+        }
+    }
     Ok(Json(response))
 }
 

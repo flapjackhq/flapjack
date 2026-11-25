@@ -1823,12 +1823,10 @@ impl SpoolStore {
             (MigrationDisposition::Running, Some(_)) => {
                 Err(SpoolError::new(SpoolErrorKind::ManifestCorrupt))
             }
-            (
-                MigrationDisposition::Succeeded
-                | MigrationDisposition::Failed
-                | MigrationDisposition::Cancelled,
-                Some(terminal_at),
-            ) => Ok(self.now() >= self.retention_deadline(terminal_at)?),
+            (MigrationDisposition::Succeeded, Some(_)) => Ok(true),
+            (MigrationDisposition::Failed | MigrationDisposition::Cancelled, Some(terminal_at)) => {
+                Ok(self.now() >= self.retention_deadline(terminal_at)?)
+            }
             (
                 MigrationDisposition::Succeeded
                 | MigrationDisposition::Failed
