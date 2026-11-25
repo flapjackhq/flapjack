@@ -116,19 +116,20 @@ pub(super) fn resolve_search_window(
 ) -> SearchWindow {
     let hits_per_page = req.effective_hits_per_page();
     let (mut limit, mut offset) = if should_window_for_personalization {
-        let limit = hits_per_page
-            .saturating_mul(req.page.saturating_add(1))
+        let limit = req
+            .pagination_offset()
+            .saturating_add(hits_per_page)
             .saturating_add(PERSONALIZATION_RERANK_BUFFER);
         (limit.max(hits_per_page), 0)
     } else if has_geo_filter {
         (
-            (hits_per_page + req.page * hits_per_page)
+            (hits_per_page + req.pagination_offset())
                 .saturating_mul(10)
                 .max(1000),
             0,
         )
     } else {
-        (hits_per_page, req.page * hits_per_page)
+        (hits_per_page, req.pagination_offset())
     };
 
     if has_optional_filters && offset > 0 {

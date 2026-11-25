@@ -12,8 +12,8 @@ const GEO_SEARCH_UNBUCKETED_RATIO: u64 = 1;
 #[test]
 fn hybrid_fetch_window_uses_shared_formula() {
     assert_eq!(hybrid_fetch_window(20, 0), 200);
-    assert_eq!(hybrid_fetch_window(80, 1), 210);
-    assert_eq!(hybrid_fetch_window(100, 4), 550);
+    assert_eq!(hybrid_fetch_window(80, 80), 210);
+    assert_eq!(hybrid_fetch_window(100, 400), 550);
 }
 
 #[test]

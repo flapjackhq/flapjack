@@ -43,6 +43,8 @@ impl super::SearchRequest {
                     self.hits_per_page = Some(v);
                 }
             }
+            "offset" => self.offset = value.parse().ok(),
+            "length" => self.length = value.parse().ok(),
             "page" => {
                 self.page = value.parse().unwrap_or(0);
             }

@@ -707,3 +707,53 @@ fn live_preview_receipt_includes_status_body_counts_and_codes() {
         })
     );
 }
+
+#[tokio::test]
+#[serial_test::serial(flapjack_outbound_url_policy)]
+async fn hosted_algolia_preview_strips_cross_tenant_replica_topology() {
+    use crate::api_profile::ApiProfile;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let replica_reads = Arc::new(AtomicUsize::new(0));
+    let observed = replica_reads.clone();
+    let source = axum::Router::new().fallback(move |request: Request<Body>| {
+        let observed = observed.clone();
+        async move {
+            let payload = match request.uri().path() {
+                "/1/indexes" => json!({"items":[{"name":"products","entries":1,"updatedAt":"2026-01-01T00:00:00Z","pendingTask":false}],"page":0,"nbPages":1}),
+                "/1/indexes/products/settings" => json!({"searchableAttributes":["title"],"replicas":["other_customer_private_index"]}),
+                "/1/indexes/products/rules/search" | "/1/indexes/products/synonyms/search" => json!({"hits":[],"nbHits":0,"page":0,"nbPages":0,"hitsPerPage":1000}),
+                "/1/indexes/products/browse" => json!({"hits":[{"objectID":"one","title":"Own document"}]}),
+                "/1/indexes/other_customer_private_index/settings" => {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    json!({"primary":"products","searchableAttributes":["title"]})
+                }
+                _ => return (StatusCode::NOT_FOUND, axum::Json(json!({"message":"unexpected source request"}))),
+            };
+            (StatusCode::OK, axum::Json(payload))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, source).await.unwrap();
+    });
+    let result = super::algolia_client::with_test_algolia_base_url_override(Some("APPID"), Some(&origin), async {
+        let router = axum::Router::new()
+            .route("/preview", axum::routing::post(super::preview_algolia_migration_http))
+            .layer(Extension(ApiProfile::PaidBetaV5));
+        router.oneshot(Request::builder().method("POST").uri("/preview")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"appId":"APPID","apiKey":"source-key-not-a-secret","sourceIndex":"products","targetIndex":"own_customer_products"}).to_string())).unwrap()).await.unwrap()
+    }).await;
+    server.abort();
+    let status = result.status();
+    let body = body_json(result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sourceCounts"]["records"], 1);
+    assert_eq!(body["report"]["summary"]["hardRejections"], 0);
+    assert_eq!(
+        replica_reads.load(Ordering::SeqCst),
+        0,
+        "hosted imports must never read or publish another tenant's replica topology"
+    );
+}

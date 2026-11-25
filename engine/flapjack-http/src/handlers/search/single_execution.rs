@@ -36,6 +36,9 @@ pub(super) async fn search_single_with_secured_hits_per_page_cap(
     can_see_unretrievable: bool,
     dictionary_application_id: Option<String>,
 ) -> Result<Json<serde_json::Value>, FlapjackError> {
+    if let (Some(length), Some(cap)) = (req.length.as_mut(), secured_hits_per_page_cap) {
+        *length = (*length).min(cap);
+    }
     req.validate()?;
     resolve_around_lat_lng_via_ip(&mut req, &state.geoip_reader);
 
@@ -114,10 +117,9 @@ fn prepare_search_params(
     let effective_enable_rules = req.enable_rules.or(loaded_settings
         .as_ref()
         .and_then(|settings| settings.enable_rules));
-    let pagination_limited_exceeded = loaded_settings.as_ref().is_some_and(|settings| {
-        req.page.saturating_mul(search_window.hits_per_page)
-            >= settings.pagination_limited_to as usize
-    });
+    let pagination_limited_exceeded = loaded_settings
+        .as_ref()
+        .is_some_and(|settings| req.pagination_offset() >= settings.pagination_limited_to as usize);
     let all_query_words_optional = apply_similar_query_override(req);
     normalize_query_languages(req);
 
@@ -222,7 +224,7 @@ fn search_single_sync(
                         hybrid_params: &hybrid_params,
                     },
                     hits_per_page: params.hits_per_page,
-                    page: req.page,
+                    offset: req.pagination_offset(),
                     is_interleaving,
                     pagination_limited_exceeded: params.pagination_limited_exceeded,
                 },

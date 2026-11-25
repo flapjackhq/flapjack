@@ -5368,3 +5368,86 @@ mod stage4_structural_search_params;
 mod stage4b_pipeline_regressions;
 mod stage5a_relevancy_strictness;
 mod stage5b_virtual_replica_relevancy;
+
+// https://www.algolia.com/doc/api-reference/api-parameters/offset
+// https://www.algolia.com/doc/api-reference/api-parameters/length
+#[tokio::test]
+async fn offset_length_search_uses_exact_window_and_documented_defaults() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_basic_search_state(&tmp);
+    let index = "offset_window";
+    state.manager.create_tenant(index).unwrap();
+    save_index_settings(
+        &state,
+        index,
+        &flapjack::index::settings::IndexSettings {
+            hits_per_page: 2,
+            ..Default::default()
+        },
+    );
+    state
+        .manager
+        .add_documents_sync(
+            index,
+            (0..6)
+                .map(|n| {
+                    Document::from_json(&json!({"objectID":n.to_string(), "brand":"Apple"}))
+                        .unwrap()
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let app = search_router(state.clone());
+    let all = body_json(post_search(&app, index, json!({"hitsPerPage":10}), None).await).await;
+    let ids = |body: &Value| {
+        body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["objectID"].clone())
+            .collect::<Vec<_>>()
+    };
+    for (request, start, count, offset_mode) in [
+        (json!({"offset":1,"length":1,"page":4}), 1, 1, true),
+        (json!({"offset":1}), 1, 2, true),
+        (json!({"offset":1,"hitsPerPage":3}), 1, 3, true),
+        (json!({"offset":0,"length":0}), 0, 0, true),
+        (json!({"length":1,"page":1}), 2, 2, false),
+        (json!({"params":"offset=1&length=2"}), 1, 2, true),
+        (
+            json!({"offset":1,"length":2,"optionalFilters":["brand:Apple"]}),
+            1,
+            2,
+            true,
+        ),
+        (json!({"offset":20,"length":2}), 6, 0, true),
+    ] {
+        let response = post_search(&app, index, request.clone(), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{request}");
+        let response = body_json(response).await;
+        assert_eq!(ids(&response), ids(&all)[start..start + count], "{request}");
+        assert_eq!(response["nbHits"], 6);
+        if offset_mode {
+            let requested_offset = request["offset"].as_u64().unwrap_or(1);
+            assert_eq!(response["offset"], requested_offset, "{request}");
+            let expected_length = if request.get("params").is_some() {
+                2
+            } else {
+                request["length"]
+                    .as_u64()
+                    .or(request["hitsPerPage"].as_u64())
+                    .unwrap_or(2)
+            };
+            assert_eq!(response["length"], expected_length, "{request}");
+        } else {
+            assert!(response.get("offset").is_none());
+        }
+    }
+    for request in [json!({"offset":20001}), json!({"offset":0,"length":1001})] {
+        assert_eq!(
+            post_search(&app, index, request, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}

@@ -3565,23 +3565,25 @@ mod algolia_equivalence {
                 "hitsPerPage": 100
             }))
             .send()
-            .await;
+            .await
+            .unwrap();
 
-        let status = response
-            .as_ref()
-            .map(|r| r.status())
-            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-
-        if status == 400 {
-            println!("Flapjack correctly rejects 'price > 100.5' (documented limitation)");
-            println!("  Algolia returned {} hits", fixture.expected_nb_hits);
-            println!("  Workaround: Use 'price >= 100.51' or 'price:100.51 TO *'");
-        } else {
-            panic!(
-                "Expected 400 error for float exclusive bound, got {}",
-                status
-            );
-        }
+        // Algolia supports exclusive decimal bounds; compare the captured result.
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        assert_eq!(response["nbHits"], fixture.expected_nb_hits);
+        let flapjack_ids: Vec<_> = response["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["objectID"].as_str().unwrap())
+            .collect();
+        let algolia_ids: Vec<_> = fixture
+            .expected_hits
+            .iter()
+            .map(|hit| hit["objectID"].as_str().unwrap())
+            .collect();
+        assert_eq!(flapjack_ids, algolia_ids);
     }
 
     #[tokio::test]

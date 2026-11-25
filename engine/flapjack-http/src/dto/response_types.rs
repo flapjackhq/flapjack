@@ -164,6 +164,10 @@ pub struct SearchResponse {
     pub nb_pages: usize,
     #[serde(rename = "hitsPerPage")]
     pub hits_per_page: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<usize>,
     #[serde(rename = "processingTimeMS")]
     pub processing_time_ms: u64,
     #[serde(rename = "serverTimeMS")]

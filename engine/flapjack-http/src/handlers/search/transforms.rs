@@ -54,7 +54,7 @@ pub(super) fn apply_reranking_and_transforms(
                 std::mem::take(&mut result.documents),
                 groups,
                 params.sum_or_filters_scores,
-                req.page,
+                req.pagination_offset(),
                 params.hits_per_page,
             );
         }
@@ -76,7 +76,7 @@ pub(super) fn apply_reranking_and_transforms(
     }
 
     if params.should_window_for_personalization {
-        let page_start = req.page.saturating_mul(params.hits_per_page);
+        let page_start = req.pagination_offset();
         if page_start >= result.documents.len() {
             result.documents.clear();
         } else {
@@ -261,7 +261,7 @@ fn apply_geo_filtering(
     sort_around_results(&mut geo_docs, geo_params);
 
     let total_geo = geo_docs.len();
-    let start = (req.page * params.hits_per_page).min(total_geo);
+    let start = (req.pagination_offset()).min(total_geo);
     let end = (start + params.hits_per_page).min(total_geo);
     let docs: Vec<ScoredDocument> = geo_docs[start..end]
         .iter()

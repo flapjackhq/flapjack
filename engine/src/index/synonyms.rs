@@ -18,7 +18,7 @@ pub enum Synonym {
         object_id: String,
         synonyms: Vec<String>,
     },
-    #[serde(rename = "onewaysynonym")]
+    #[serde(rename = "onewaysynonym", alias = "oneWaySynonym")]
     OneWay {
         #[serde(rename = "objectID")]
         object_id: String,
@@ -557,6 +557,30 @@ mod tests {
             vec!["mobile"],
             "one-way should not expand reverse direction"
         );
+    }
+
+    // Algolia documents camelCase for classic clients; current clients use lowercase.
+    // https://www.algolia.com/doc/api-reference/api-methods/save-synonym
+    #[test]
+    fn camel_case_one_way_synonym_persists_and_expands_only_forward() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("synonyms.json");
+        for spelling in ["oneWaySynonym", "onewaysynonym"] {
+            let rule: Synonym = serde_json::from_value(serde_json::json!({
+                "objectID":"tablet-ipad", "type":spelling,
+                "input":"tablet", "synonyms":["ipad"]
+            }))
+            .unwrap();
+            let mut store = SynonymStore::new();
+            store.insert(rule.clone());
+            store.save(&path).unwrap();
+            let loaded = SynonymStore::load(&path).unwrap();
+            assert_eq!(loaded.get("tablet-ipad"), Some(&rule));
+            assert!(loaded.expand_query("tablet").contains(&"ipad".to_string()));
+            assert_eq!(loaded.expand_query("ipad"), vec!["ipad"]);
+            // Keep the current response and on-disk spelling stable.
+            assert_eq!(serde_json::to_value(rule).unwrap()["type"], "onewaysynonym");
+        }
     }
 
     // -- serde round-trip --
