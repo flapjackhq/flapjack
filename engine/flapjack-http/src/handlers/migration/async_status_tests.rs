@@ -490,9 +490,9 @@ async fn async_cancel_terminal_jobs_returns_existing_terminal_status() {
     }
 }
 
-/// TODO: Document async_acknowledge_terminal_job_returns_no_content_and_preserves_phase.
+/// TODO: Document async_acknowledge_terminal_job_returns_no_content_and_removes_job.
 #[tokio::test]
-async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase() {
+async fn async_acknowledge_terminal_job_returns_no_content_and_removes_job() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
@@ -518,7 +518,7 @@ async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase()
     spool
         .transition_migration_phase(job_uuid, MigrationPhase::Activating)
         .unwrap();
-    let terminal = spool.succeed_migration(job_uuid, None).unwrap();
+    spool.succeed_migration(job_uuid, None).unwrap();
 
     let status = acknowledge_algolia_migration(
         State(Arc::clone(&state)),
@@ -530,7 +530,7 @@ async fn async_acknowledge_terminal_job_returns_no_content_and_preserves_phase()
     .expect("terminal ACK should be accepted");
 
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+    assert!(!spool.job_dir(job_uuid).exists());
 }
 
 #[tokio::test]
@@ -570,18 +570,6 @@ async fn async_acknowledge_uses_authenticated_header_owner_identity() {
         .unwrap();
     let terminal_before = spool.succeed_migration(job_uuid, None).unwrap();
 
-    let first = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
-    assert_eq!(first.status(), StatusCode::NO_CONTENT);
-    let terminal_between = spool.read_migration_phase(job_uuid).unwrap();
-    assert_eq!(terminal_between, terminal_before);
-
-    let second = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
-    assert_eq!(second.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        spool.read_migration_phase(job_uuid).unwrap(),
-        terminal_before
-    );
-
     let wrong_key =
         send_acknowledge_request(&app, job_uuid, "async-owner-app", "wrong-secret-key").await;
     assert_eq!(wrong_key.status(), StatusCode::NOT_FOUND);
@@ -598,6 +586,11 @@ async fn async_acknowledge_uses_authenticated_header_owner_identity() {
         spool.read_migration_phase(job_uuid).unwrap(),
         terminal_before
     );
+    let first = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    assert!(!spool.job_dir(job_uuid).exists());
+    let second = send_acknowledge_request(&app, job_uuid, "async-owner-app", "secret-key").await;
+    assert_migration_job_not_found(second, "ACK after job removal").await;
 }
 
 #[tokio::test]
@@ -635,7 +628,7 @@ async fn async_acknowledge_running_job_fails_closed_without_mutating_phase() {
 }
 
 #[tokio::test]
-async fn async_acknowledge_failed_and_cancelled_jobs_preserve_terminal_compatibility() {
+async fn async_acknowledge_failed_and_cancelled_jobs_remove_terminal_job() {
     let tmp = TempDir::new().unwrap();
     let state = TestStateBuilder::new(&tmp).build_shared();
     let spool = import::spool_for_manager(&state.manager).unwrap();
@@ -662,7 +655,7 @@ async fn async_acknowledge_failed_and_cancelled_jobs_preserve_terminal_compatibi
         .unwrap();
     let failed_terminal = spool.fail_migration(failed_job).unwrap();
 
-    for (job_uuid, terminal) in [
+    for (job_uuid, _terminal) in [
         (cancelled_job, cancelled_terminal),
         (failed_job, failed_terminal),
     ] {
@@ -673,10 +666,10 @@ async fn async_acknowledge_failed_and_cancelled_jobs_preserve_terminal_compatibi
             AxumPath(job_uuid.to_string()),
         )
         .await
-        .expect("failed and cancelled ACKs should remain idempotent no-ops");
+        .expect("failed and cancelled terminal jobs can be acknowledged");
 
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+        assert!(!spool.job_dir(job_uuid).exists());
     }
 }
 
@@ -764,7 +757,7 @@ async fn async_acknowledge_published_terminal_job_accepts_current_generation() {
     spool
         .transition_migration_phase(job_uuid, MigrationPhase::Activating)
         .unwrap();
-    let terminal = spool.succeed_migration(job_uuid, None).unwrap();
+    spool.succeed_migration(job_uuid, None).unwrap();
 
     let status = acknowledge_algolia_migration(
         State(Arc::clone(&state)),
@@ -776,7 +769,70 @@ async fn async_acknowledge_published_terminal_job_accepts_current_generation() {
     .expect("published terminal ACK should accept matching current generation evidence");
 
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(spool.read_migration_phase(job_uuid).unwrap(), terminal);
+    assert!(!spool.job_dir(job_uuid).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_import_ack_removes_job_directory_across_restart() {
+    let tmp = TempDir::new().unwrap();
+    let state = TestStateBuilder::new(&tmp).build_shared();
+    let factory =
+        TestMigrationSourceReaderFactory::new(|_| Ok(Box::new(async_hermetic_source_reader())));
+    let app = migration_job_route_for_provider_with_test_source_factory(
+        "algolia",
+        Arc::clone(&state),
+        Some(factory),
+    );
+    let response = send_submit_request(
+        &app,
+        "cleanup-owner",
+        "test-key-not-a-secret",
+        algolia_submit_payload("cleanup_target"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job = job_uuid_from_submit_response(response).await;
+    let terminal =
+        wait_for_route_terminal(&app, job, "cleanup-owner", "test-key-not-a-secret").await;
+    assert_eq!(terminal["disposition"], "succeeded");
+    state.migration_runner.drain_active_imports().await;
+    let job_dir = import::spool_for_manager(&state.manager)
+        .unwrap()
+        .job_dir(job);
+    assert!(job_dir.is_dir());
+    let ack = send_acknowledge_request(&app, job, "cleanup-owner", "test-key-not-a-secret").await;
+    assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !job_dir.exists(),
+        "ACK must remove the whole import job directory"
+    );
+    drop(
+        state
+            .manager
+            .quiesce_tenant(&"cleanup_target".to_string())
+            .await
+            .unwrap(),
+    );
+    drop(app);
+    drop(state);
+    let restarted = TestStateBuilder::new(&tmp).build_shared();
+    import::spool_for_manager(&restarted.manager)
+        .unwrap()
+        .recover()
+        .unwrap();
+    assert!(!job_dir.exists());
+    assert!(restarted
+        .manager
+        .get_document(&"cleanup_target".to_string(), "doc-1")
+        .unwrap()
+        .is_some());
+    let app = migration_job_route(restarted);
+    assert_eq!(
+        send_status_request(&app, job, "cleanup-owner", "test-key-not-a-secret")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 /// Migration job lifecycle wire surface owned by one source provider.
@@ -1273,14 +1329,14 @@ async fn async_runner_created_job_is_isolated_by_authenticated_app_and_key() {
         let acknowledge = send_acknowledge_request(&app, job_uuid, OWNER_APP, OWNER_KEY).await;
         assert_eq!(
             acknowledge.status(),
-            StatusCode::NO_CONTENT,
-            "rightful authenticated ACK {attempt} should be idempotent"
+            if attempt == 1 {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            "rightful ACK removes the job; replay sees it absent"
         );
-        assert_eq!(
-            spool.read_migration_phase(job_uuid).unwrap(),
-            terminal_before,
-            "rightful authenticated ACK {attempt} must preserve the terminal phase"
-        );
+        assert!(!spool.job_dir(job_uuid).exists());
     }
 }
 
@@ -2477,11 +2533,7 @@ async fn meilisearch_http_submission_uses_shared_cancel_recovery_ack_and_gc_life
     )
     .unwrap();
     gc_store.collect_garbage().unwrap();
-    assert_eq!(
-        gc_store.read_migration_phase(job_uuid).unwrap().disposition,
-        MigrationDisposition::Cancelled,
-        "terminal GC must follow the shared retention owner and keep control-plane phase readable"
-    );
+    assert!(!gc_store.job_dir(job_uuid).exists());
 }
 
 #[tokio::test]

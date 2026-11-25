@@ -1935,22 +1935,21 @@ async fn async_import_create_then_overwrite_replaces_exact_target() {
             .collect::<Vec<_>>()
     );
 
-    for attempt in 1..=2 {
-        let status = acknowledge_algolia_migration(
-            State(Arc::clone(&state)),
-            Extension(AuthenticatedAppId(ASYNC_REPLACE_OWNER_APP_ID.to_string())),
-            owner_headers.clone(),
-            axum::extract::Path(initial_job_uuid.to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("initial authenticated ACK {attempt} failed: {error:?}"));
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(
-            read_migration_phase_at(&state.manager.base_path, initial_job_uuid),
-            initial_terminal,
-            "authenticated ACK {attempt} must not mutate the terminal phase"
-        );
-    }
+    let status = acknowledge_algolia_migration(
+        State(Arc::clone(&state)),
+        Extension(AuthenticatedAppId(ASYNC_REPLACE_OWNER_APP_ID.to_string())),
+        owner_headers.clone(),
+        axum::extract::Path(initial_job_uuid.to_string()),
+    )
+    .await
+    .expect("initial authenticated ACK should remove the job");
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        !SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+            .unwrap()
+            .job_dir(initial_job_uuid)
+            .exists()
+    );
 
     let replacement_request = MigrateFromAlgoliaRequest {
         target_index: Some(ASYNC_REPLACE_TARGET.to_string()),
@@ -2001,24 +2000,21 @@ async fn async_import_create_then_overwrite_replaces_exact_target() {
         );
     }
 
-    for attempt in 1..=2 {
-        let status = acknowledge_algolia_migration(
-            State(Arc::clone(&state)),
-            Extension(AuthenticatedAppId(ASYNC_REPLACE_OWNER_APP_ID.to_string())),
-            owner_headers.clone(),
-            axum::extract::Path(replacement_job_uuid.to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| {
-            panic!("replacement authenticated ACK {attempt} failed: {error:?}")
-        });
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(
-            read_migration_phase_at(&state.manager.base_path, replacement_job_uuid),
-            replacement_terminal,
-            "authenticated ACK {attempt} must not mutate the replacement terminal phase"
-        );
-    }
+    let status = acknowledge_algolia_migration(
+        State(Arc::clone(&state)),
+        Extension(AuthenticatedAppId(ASYNC_REPLACE_OWNER_APP_ID.to_string())),
+        owner_headers.clone(),
+        axum::extract::Path(replacement_job_uuid.to_string()),
+    )
+    .await
+    .expect("replacement authenticated ACK should remove the job");
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        !SpoolStore::new(&state.manager.base_path, SpoolLimits::default())
+            .unwrap()
+            .job_dir(replacement_job_uuid)
+            .exists()
+    );
 
     let final_hits = sorted_async_replace_hits(&state).await;
     assert_eq!(final_hits.len(), 3);
