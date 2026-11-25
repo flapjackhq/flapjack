@@ -190,6 +190,10 @@ pub struct SearchRequest {
     pub hits_per_page: Option<usize>,
     #[serde(default)]
     pub page: usize,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub length: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub facets: Option<Vec<String>>,
     #[serde(default)]
@@ -341,7 +345,16 @@ pub struct SearchRequest {
 
 impl SearchRequest {
     pub fn effective_hits_per_page(&self) -> usize {
-        self.hits_per_page.unwrap_or(20)
+        self.offset
+            .and(self.length)
+            .or(self.hits_per_page)
+            .unwrap_or(20)
+    }
+
+    /// Zero-based result position, with offset taking precedence over page.
+    pub fn pagination_offset(&self) -> usize {
+        self.offset
+            .unwrap_or_else(|| self.page.saturating_mul(self.effective_hits_per_page()))
     }
 
     /// Validates this search request against Algolia-compatible limits and structural constraints.
@@ -372,7 +385,12 @@ impl SearchRequest {
         }
 
         let hpp = self.effective_hits_per_page();
-        let offset = self.page.saturating_mul(hpp);
+        if self.offset.is_some() && hpp > MAX_HITS_PER_PAGE {
+            return Err(FlapjackError::InvalidQuery(
+                "length exceeds maximum hits per query".into(),
+            ));
+        }
+        let offset = self.pagination_offset();
         if offset > MAX_PAGINATION_OFFSET {
             return Err(FlapjackError::InvalidQuery(format!(
                 "Pagination offset (page {} * hitsPerPage {}) exceeds maximum of {}",

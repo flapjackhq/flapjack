@@ -32,6 +32,27 @@ async function waitForIndexing(indexName, expectedCount, maxWaitMs = 5000) {
   }
 }
 
+// https://www.algolia.com/doc/rest-api/search/save-object
+// The documented POST examples supply objectID in the body.
+test('saveObject preserves body objectID and replaces the same record', async () => {
+  const indexName = `${TEST_INDEX}_body_id`;
+  try {
+    for (const name of ['first', 'updated']) {
+      const saved = await client.saveObject({ indexName, body: { objectID: 'supplied-id', name } });
+      if (saved.objectID !== 'supplied-id') throw new Error(`Replaced supplied ID with ${saved.objectID}`);
+      await client.waitForTask({ indexName, taskID: saved.taskID });
+    }
+    const record = await client.getObject({ indexName, objectID: 'supplied-id' });
+    const result = await client.searchSingleIndex({ indexName, searchParams: { query: '' } });
+    if (record.name !== 'updated' || result.nbHits !== 1) throw new Error('saveObject did not replace one record');
+    const saved = await client.saveObject({ indexName, body: { name: 'auto' } });
+    const retry = await client.saveObject({ indexName, body: { name: 'auto' } });
+    if (!saved.objectID || saved.objectID !== retry.objectID) throw new Error('ID-less retry must retain a stable generated ID');
+  } finally {
+    await cleanupIndexes([indexName]);
+  }
+});
+
 test('POST /1/indexes/{indexName}/batch - addObject', async () => {
   await client.saveObjects({
     indexName: TEST_INDEX,
@@ -234,6 +255,28 @@ test('POST /1/indexes/{indexName}/query - filters', async () => {
   }
 });
 
+// https://www.algolia.com/doc/api-reference/api-parameters/numericFilters
+test('numeric inequalities include exact decimal boundaries', async () => {
+  const indexName = `${TEST_INDEX}_float_filters`;
+  try {
+    const ratings = [4, 4.499, 4.5, 4.501, 5];
+    for (const { taskID } of await client.saveObjects({ indexName, objects: ratings.map(rating => ({ objectID: String(rating), rating })) })) {
+      await client.waitForTask({ indexName, taskID });
+    }
+    for (const [op, bound, predicate] of [
+      ['>', 4, x => x > 4], ['<', 5, x => x < 5],
+      ['>', 4.4, x => x > 4.4], ['<', 4.5, x => x < 4.5],
+      ['>=', 4.5, x => x >= 4.5], ['<=', 4.5, x => x <= 4.5],
+    ]) {
+      for (const searchParams of [{ numericFilters: [`rating ${op} ${bound}`] }, { filters: `rating ${op} ${bound}` }]) {
+        const result = await client.searchSingleIndex({ indexName, searchParams });
+        const actual = result.hits.map(hit => hit.rating).sort();
+        if (JSON.stringify(actual) !== JSON.stringify(ratings.filter(predicate))) throw new Error(`Incorrect ${JSON.stringify(searchParams)}: ${actual}`);
+      }
+    }
+  } finally { await cleanupIndexes([indexName]); }
+});
+
 test('POST /1/indexes/{indexName}/query - numeric range', async () => {
   await client.saveObjects({
     indexName: TEST_INDEX,
@@ -256,6 +299,27 @@ test('POST /1/indexes/{indexName}/query - numeric range', async () => {
   if (result.results[0].nbHits !== 1) {
     throw new Error(`Expected 1 hit for price >= 200, got ${result.results[0].nbHits}`);
   }
+});
+
+// https://www.algolia.com/doc/api-reference/api-parameters/facetFilters
+test('facetFilters negate values and preserve escaped minus signs', async () => {
+  const indexName = `${TEST_INDEX}_negative_facets`;
+  try {
+    const { taskID } = await client.setSettings({ indexName, indexSettings: { attributesForFaceting: ['brand'] } });
+    await client.waitForTask({ indexName, taskID });
+    for (const { taskID } of await client.saveObjects({ indexName, objects: ['Apple', 'Samsung', '-Apple'].map(brand => ({ objectID: brand, brand })) })) {
+      await client.waitForTask({ indexName, taskID });
+    }
+    for (const [facetFilters, expected] of [
+      [['brand:-Apple'], ['-Apple', 'Samsung']],
+      [['brand:\\-Apple'], ['-Apple']],
+      [['brand:-Apple', 'brand:Samsung'], ['Samsung']],
+      [[['brand:-Apple', 'brand:Apple']], ['-Apple', 'Apple', 'Samsung']],
+    ]) {
+      const result = await client.searchSingleIndex({ indexName, searchParams: { facetFilters } });
+      if (JSON.stringify(result.hits.map(hit => hit.objectID).sort()) !== JSON.stringify(expected)) throw new Error(`Incorrect facetFilters ${JSON.stringify(facetFilters)}`);
+    }
+  } finally { await cleanupIndexes([indexName]); }
 });
 
 test('POST /1/indexes/{indexName}/query - facets', async () => {
@@ -292,6 +356,25 @@ test('POST /1/indexes/{indexName}/query - facets', async () => {
   if (facets.electronics !== 1) {
     throw new Error(`Expected electronics:1, got ${facets.electronics}`);
   }
+});
+
+// https://www.algolia.com/doc/api-reference/api-parameters/offset
+test('offset and length paginate single-index and multi-index searches', async () => {
+  const indexName = `${TEST_INDEX}_offset`;
+  try {
+    for (const { taskID } of await client.saveObjects({ indexName, objects: Array.from({ length: 6 }, (_, n) => ({ objectID: String(n), name: 'item' })) })) {
+      await client.waitForTask({ indexName, taskID });
+    }
+    const all = await client.searchSingleIndex({ indexName, searchParams: { hitsPerPage: 10 } });
+    const ids = result => result.hits.map(hit => hit.objectID);
+    for (const searchParams of [{ offset: 1, length: 2, page: 4 }, { params: 'offset=1&length=2' }]) {
+      const single = await client.searchSingleIndex({ indexName, searchParams });
+      const batch = await client.search({ requests: [{ indexName, ...searchParams }] });
+      for (const result of [single, batch.results[0]]) {
+        if (JSON.stringify(ids(result)) !== JSON.stringify(ids(all).slice(1, 3)) || result.offset !== 1 || result.length !== 2 || result.nbHits !== 6) throw new Error('Incorrect offset/length window or metadata');
+      }
+    }
+  } finally { await cleanupIndexes([indexName]); }
 });
 
 test('POST /1/indexes/*/queries - multi-index search', async () => {
@@ -685,6 +768,22 @@ test('DELETE /1/keys/:key - delete API key', async () => {
 // =========================================================================
 // InstantSearch Response Shapes
 // =========================================================================
+
+// https://www.algolia.com/doc/api-reference/api-methods/save-synonym
+test('camelCase oneWaySynonym accepts the classic client body and stays directed', async () => {
+  const indexName = `${TEST_INDEX}_oneway`;
+  try {
+    for (const { taskID } of await client.saveObjects({ indexName, objects: [{ objectID: 'tablet', name: 'tablet' }, { objectID: 'ipad', name: 'ipad' }] })) {
+      await client.waitForTask({ indexName, taskID });
+    }
+    const { taskID } = await client.saveSynonym({ indexName, objectID: 'directed', synonymHit: { objectID: 'directed', type: 'oneWaySynonym', input: 'tablet', synonyms: ['ipad'] } });
+    await client.waitForTask({ indexName, taskID });
+    const forward = await client.searchSingleIndex({ indexName, searchParams: { query: 'tablet', typoTolerance: false } });
+    const reverse = await client.searchSingleIndex({ indexName, searchParams: { query: 'ipad', typoTolerance: false } });
+    if (JSON.stringify(forward.hits.map(hit => hit.objectID).sort()) !== JSON.stringify(['ipad', 'tablet'])) throw new Error('Missing forward synonym expansion');
+    if (JSON.stringify(reverse.hits.map(hit => hit.objectID)) !== JSON.stringify(['ipad'])) throw new Error('One-way synonym expanded in reverse');
+  } finally { await cleanupIndexes([indexName]); }
+});
 
 test('Search response - InstantSearch-compatible shape (hits, facets, pagination, highlighting)', async () => {
   // Ensure we have data and faceting configured

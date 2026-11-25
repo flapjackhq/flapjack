@@ -832,6 +832,9 @@ fn migration_job_route_for_provider_with_test_source_factory(
             post(acknowledge_algolia_migration_http),
         )
         .route("/:job_id/cancel", post(cancel_algolia_migration_http))
+        .layer(axum::extract::Extension(
+            crate::api_profile::ApiProfile::Full,
+        ))
         .with_state(state);
     let provider_routes = match test_source_factory {
         Some(factory) => provider_routes.layer(axum::extract::Extension(factory)),

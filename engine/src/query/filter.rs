@@ -129,53 +129,22 @@ impl FilterCompiler {
                 min,
                 max
             )),
-            Filter::GreaterThan { field, value } => match value {
-                crate::types::FieldValue::Integer(i) => Ok(format!(
-                    "{}:[{} TO *]",
-                    self.json_filter_field_path(field)?,
-                    i + 1
-                )),
-                crate::types::FieldValue::Float(_) => {
-                    Err(crate::error::FlapjackError::InvalidQuery(format!(
-                        "Exclusive '>' not supported on floats for field '{}'. Use '>='",
-                        field
-                    )))
-                }
-                crate::types::FieldValue::Date(d) => Ok(format!(
-                    "{}:[{} TO *]",
-                    self.json_filter_field_path(field)?,
-                    d + 1
-                )),
-                _ => Err(crate::error::FlapjackError::InvalidQuery(
-                    "GreaterThan only supports integer/date values".to_string(),
-                )),
-            },
+            // Native exclusive bounds preserve decimals and avoid integer overflow.
+            Filter::GreaterThan { field, value } => Ok(format!(
+                "{}:{{{} TO *]",
+                self.json_filter_field_path(field)?,
+                self.format_range_value(value)?
+            )),
             Filter::GreaterThanOrEqual { field, value } => Ok(format!(
                 "{}:[{} TO *]",
                 self.json_filter_field_path(field)?,
                 self.format_range_value(value)?
             )),
-            Filter::LessThan { field, value } => match value {
-                crate::types::FieldValue::Integer(i) => Ok(format!(
-                    "{}:[* TO {}]",
-                    self.json_filter_field_path(field)?,
-                    i - 1
-                )),
-                crate::types::FieldValue::Float(_) => {
-                    Err(crate::error::FlapjackError::InvalidQuery(format!(
-                        "Exclusive '<' not supported on floats for field '{}'. Use '<='",
-                        field
-                    )))
-                }
-                crate::types::FieldValue::Date(d) => Ok(format!(
-                    "{}:[* TO {}]",
-                    self.json_filter_field_path(field)?,
-                    d - 1
-                )),
-                _ => Err(crate::error::FlapjackError::InvalidQuery(
-                    "LessThan only supports integer/date values".to_string(),
-                )),
-            },
+            Filter::LessThan { field, value } => Ok(format!(
+                "{}:[* TO {}}}",
+                self.json_filter_field_path(field)?,
+                self.format_range_value(value)?
+            )),
             Filter::LessThanOrEqual { field, value } => Ok(format!(
                 "{}:[* TO {}]",
                 self.json_filter_field_path(field)?,
@@ -235,7 +204,7 @@ impl FilterCompiler {
     }
 
     fn format_text_value(&self, value: &str) -> String {
-        if value.chars().all(Self::is_safe_bare_text_char) {
+        if !value.starts_with('-') && value.chars().all(Self::is_safe_bare_text_char) {
             value.to_string()
         } else {
             format!("\"{}\"", Self::escape_quoted_query_value(value))

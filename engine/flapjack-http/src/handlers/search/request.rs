@@ -174,6 +174,10 @@ where
     if let Some(hits_per_page) = options.hits_per_page {
         parts.push(format!("hitsPerPage={hits_per_page}"));
     }
+    if let Some(offset) = req.offset {
+        parts.push(format!("offset={offset}"));
+        parts.push(format!("length={}", req.effective_hits_per_page()));
+    }
     if req.page > 0 {
         parts.push(format!("page={}", req.page));
     }
