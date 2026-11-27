@@ -41,6 +41,8 @@ jobs:
         run: python3 engine/tests/test_extract_candidate_binary.py
       - name: Backend environment contracts
         run: python3 engine/tests/test_dashboard_e2e_backend_contract.py
+      - name: Published predecessor selection contracts
+        run: python3 engine/tests/test_release_predecessors.py
       - name: Rust test routing
         id: paths
         env:

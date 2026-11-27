@@ -641,7 +641,7 @@ EOF
 
   if PATH="$fake_bin:$PATH" "$RELEASE_MANIFEST_HELPER" "x86_64-unknown-linux-musl" "$bin_path" "$output_dir" >/dev/null 2>&1; then
     manifest_path="$output_dir/flapjack-x86_64-unknown-linux-musl.manifest.json"
-    if python3 - "$manifest_path" "$output_dir/flapjack-x86_64-unknown-linux-musl.tar.gz" "$bin_path" <<'PY'
+    if python3 - "$manifest_path" "$output_dir/flapjack-x86_64-unknown-linux-musl.tar.gz" "$bin_path" "$ENGINE_COMPATIBILITY" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -668,7 +668,7 @@ expected_build = {
 expected_compatibility = {
     "schemaVersion": 1,
     "target": "x86_64-unknown-linux-musl",
-    "predecessors": [],
+    "predecessors": json.loads(pathlib.Path(sys.argv[4]).read_text())["targets"]["x86_64-unknown-linux-musl"],
     "dataDisposition": "preserve",
     "mixedVersionReplication": "not_guaranteed",
 }
@@ -707,10 +707,10 @@ PY
     fi
 
     if predecessors="$($RELEASE_MANIFEST_HELPER --compatibility-predecessors "$manifest_path" 2>/dev/null)" \
-      && [ -z "$predecessors" ]; then
-      pass "release_artifact_manifest validates the candidate manifest and reports no unclaimed predecessors"
+      && [ "$(printf '%s\n' "$predecessors" | wc -l | tr -d ' ')" = "$(jq '.compatibility.predecessors | length' "$manifest_path")" ]; then
+      pass "release_artifact_manifest reports every canonical predecessor"
     else
-      fail "release_artifact_manifest validates the candidate manifest and reports no unclaimed predecessors"
+      fail "release_artifact_manifest reports every canonical predecessor"
     fi
 
     assert_predecessor_consumer_contract "$manifest_path" "$tmp_dir"
@@ -1010,7 +1010,7 @@ assert_cross_passthrough_variable \
 assert_job_contains "build" 'package/build_release_artifact[[:space:]]*\\?$' "the public build matrix calls the shared build helper"
 assert_job_contains "build" '^[[:space:]]*public-all[[:space:]]*\\?$' "the public build matrix selects only the public-all closed profile"
 assert_job_contains "build" 'git rev-parse.*github\.sha.*\^\{tree\}' "the public build matrix supplies the exact candidate tree to the helper"
-assert_job_contains "build" '^[[:space:]]*package/engine_compatibility\.json[[:space:]]*\\?$' "the public build matrix passes only the checked-in compatibility SSOT"
+assert_job_contains "build" 'RUNNER_TEMP/release-predecessors/engine_compatibility\.json' "the public build matrix uses resolved published predecessors"
 assert_job_not_contains "build" '^[[:space:]]*(cargo|cross) build|npm (ci|run build)|package/release_artifact_manifest' "release.yml cannot bypass the shared build and packaging owner"
 assert_job_not_contains "build" '^[[:space:]]*(features|use_cross):' "release.yml does not duplicate the helper's builder or feature map"
 assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.manifest\\.json" "release.yml uploads and publishes manifest JSON assets"
@@ -1021,7 +1021,20 @@ assert_contains "$RELEASE_WORKFLOW" "flapjack-\\*\\.zip\\.sha256" "release.yml u
 assert_job_contains "build" 'engine/flapjack-\$\{\{ matrix\.target \}\}\.build\.json' "the build job uploads each exact source/toolchain build receipt"
 assert_job_contains "release" 'flapjack-\*\.build\.json' "the public release publishes every exact source/toolchain build receipt"
 assert_file_executable "$RELEASE_MANIFEST_HELPER" "release_artifact_manifest helper is executable"
-assert_contains "$ENGINE_COMPATIBILITY" '^\{"dataDisposition":"preserve","mixedVersionReplication":"not_guaranteed","schemaVersion":2,"targets":\{"aarch64-unknown-linux-musl":\[\{"binarySha256":"a6389ebf495d2d701e45bddb6d8ee7672bda6915d82cd04c2e584d44f94ae8f2","forwardTransferMode":"reuse_same_data_directory","manifestSha256":"fe5826bd01f505f30bd50dd0ad6fd567cf37e06925cac4e202aa00181423a542","parityProfile":"same_data_upgrade_smoke_v1","releaseTag":"v1\.0\.18","rollbackMode":"binary_reactivate_same_data","transitionMode":"routine_same_host"\}\],"x86_64-unknown-linux-musl":\[\]\}\}$' "engine compatibility SSOT binds the published v1.0.18 predecessor for routine aarch64 replacement"
+if python3 - "$ENGINE_COMPATIBILITY" <<'PYTEST'
+import json, sys
+source = json.load(open(sys.argv[1]))
+for target in ("aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"):
+    assert [e["releaseTag"] for e in source["targets"][target]] == ["v1.0.18", "v1.0.19", "v1.0.20"]
+PYTEST
+then pass "v21 baseline admits all three prior published versions on both Linux targets"
+else fail "v21 baseline admits all three prior published versions on both Linux targets"
+fi
+assert_job_needs "build" "release_predecessors" "all release packages wait for automatic predecessor selection"
+assert_job_contains "release_predecessors" 'package/release_predecessors\.py' "release workflow resolves prior published releases by default"
+assert_job_contains "build" '^[[:space:]]*--published-predecessors' "public packaging independently verifies automatic predecessor selection"
+assert_job_contains "engine_compatibility_gate" 'RUNNER_TEMP/release-predecessors/engine_compatibility\.json' "populated smoke consumes the exact resolved source used by packaging"
+assert_contains "$CI_WORKFLOW" 'python3 engine/tests/test_release_predecessors\.py' "public CI runs behavioral predecessor selection tests"
 assert_contains "$RELEASE_BUILD_HELPER" 'COMPATIBILITY_SOURCE_SHA256' "build helper binds the exact compatibility source digest in its receipt"
 assert_contains "$RELEASE_BUILD_HELPER" 'COMPATIBILITY_SELECTED_SHA256' "build helper binds the exact target-selected compatibility digest in its receipt"
 assert_release_helper_contract

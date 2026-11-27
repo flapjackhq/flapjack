@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.21] - 2026-11-26
+
+### Fixed
+- Declare and test the previous three published engine releases as populated same-data-directory upgrade predecessors, preserving documents, settings, synonyms, and rules. Runtime behavior is unchanged from v1.0.20.
+
 ## [1.0.20] - 2026-11-25
 
 ### Fixed

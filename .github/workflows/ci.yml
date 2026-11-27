@@ -78,6 +78,9 @@ jobs:
       - name: Release workflow structure contract
         run: bash engine/tests/test_release_workflow_structure.sh
 
+      - name: Published predecessor selection contracts
+        run: python3 engine/tests/test_release_predecessors.py
+
       - name: GHCR publish preflight contract
         run: bash engine/tests/test_ghcr_publish_preflight.sh
 

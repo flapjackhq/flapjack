@@ -43,6 +43,7 @@ OLD_LOG=""
 NEW_LOG=""
 OLD_PID=""
 NEW_PID=""
+STARTED_PID=""
 INTERRUPTED_EXIT_CODE=0
 
 pass() {
@@ -155,6 +156,42 @@ verify_search_hits() {
     || fail "unexpected object IDs for query '$query'"
 }
 
+# The same persisted fixture is read by both executables and by rollback.
+preserved_resources() {
+  local operation="$1" base="$2" saved_index="$INDEX_NAME" resource response
+  for INDEX_NAME in upgrade_smoke upgrade_smoke_secondary; do
+    if [ "$operation" = seed ]; then
+      for resource in settings synonyms/upgrade-syn rules/upgrade-rule; do
+        case "$resource" in
+          settings) response='{"searchableAttributes":["token"],"customRanking":["asc(rank)"],"typoTolerance":false}' ;;
+          synonyms/*) response='{"objectID":"upgrade-syn","type":"synonym","synonyms":["zebracobaltquartz","quartzalias"]}' ;;
+          rules/*) response='{"objectID":"upgrade-rule","conditions":[{"pattern":"zebracobaltquartz","anchoring":"is"}],"consequence":{"promote":[{"objectID":"old-doc-2","position":0}]},"enabled":true}' ;;
+        esac
+        response="$(http_json PUT "$base/1/indexes/$INDEX_NAME/$resource" "$response")"
+        wait_for_task_published "$base" "$(printf '%s' "$response" | jq -er .taskID)"
+      done
+    fi
+    for resource in old-doc-1 old-doc-2 settings synonyms/upgrade-syn rules/upgrade-rule; do
+      response="$(http_json GET "$base/1/indexes/$INDEX_NAME/$resource" | jq -S -c .)"
+      if [ "$operation" = seed ]; then
+        printf '%s\n' "$response" >"$TMP_DIR/$INDEX_NAME.${resource//\//_}.json"
+      else
+        printf '%s\n' "$response" >"$TMP_DIR/actual.json"
+        cmp -s "$TMP_DIR/$INDEX_NAME.${resource//\//_}.json" "$TMP_DIR/actual.json" \
+          || fail "$INDEX_NAME lost or changed $resource across the binary transition"
+      fi
+    done
+    verify_search_hits "$base" "$QUERY_TOKEN" 2 "$OLD_OBJECT_IDS"
+    verify_search_hits "$base" quartzalias 2 "$OLD_OBJECT_IDS"
+    verify_search_hits "$base" 'Upgrade smoke' 0 '[]'
+    http_json POST "$base/1/indexes/$INDEX_NAME/query" '{"query":"zebracobaltquartz"}' \
+      | jq -e '.hits[0].objectID == "old-doc-2"' >/dev/null \
+      || fail "$INDEX_NAME promotion rule did not survive"
+    pass "$INDEX_NAME documents, settings, synonyms, rules and search behavior verified ($operation)"
+  done
+  INDEX_NAME="$saved_index"
+}
+
 validate_binary_manifest() {
   local label="$1"
   local bin_path="$2"
@@ -243,7 +280,7 @@ start_server() {
   FLAPJACK_DATA_DIR="$DATA_DIR" \
   "$bin_path" >"$log_path" 2>&1 &
 
-  printf '%s' "$!"
+  STARTED_PID=$!
 }
 
 # TODO: Document main.
@@ -314,7 +351,8 @@ main() {
   validate_binary_manifest "old" "$OLD_BIN" "$OLD_MANIFEST" 0 "$old_build_json" "$OLD_BINARY_SHA256"
   validate_binary_manifest "new" "$NEW_BIN" "$NEW_MANIFEST" 1 "$new_build_json" ""
 
-  OLD_PID="$(start_server "$OLD_BIN" "$OLD_LOG")"
+  start_server "$OLD_BIN" "$OLD_LOG"
+  OLD_PID="$STARTED_PID"
   "$WAIT_HELPER" --pid "$OLD_PID" --port auto --log-path "$OLD_LOG" >/dev/null
   local old_port
   old_port="$(extract_port_from_log "$OLD_LOG")"
@@ -323,12 +361,14 @@ main() {
 
   local batch_response
   local task_id
+  for INDEX_NAME in upgrade_smoke upgrade_smoke_secondary; do
   batch_response="$(http_json POST "$old_base/1/indexes/$INDEX_NAME/batch" '{
     "requests": [
       {
         "action": "addObject",
         "body": {
           "objectID": "old-doc-1",
+          "ownerIndex": "'"$INDEX_NAME"'", "rank": 1,
           "title": "Upgrade smoke old doc",
           "token": "'"$QUERY_TOKEN"'"
         }
@@ -337,6 +377,7 @@ main() {
         "action": "addObject",
         "body": {
           "objectID": "old-doc-2",
+          "ownerIndex": "'"$INDEX_NAME"'", "rank": 2,
           "title": "Upgrade smoke second doc",
           "token": "'"$QUERY_TOKEN"'"
         }
@@ -346,13 +387,17 @@ main() {
   task_id="$(printf '%s' "$batch_response" | jq -r '.taskID')"
   wait_for_task_published "$old_base" "$task_id"
   verify_search_hits "$old_base" "$QUERY_TOKEN" "2" "$OLD_OBJECT_IDS"
+  done
+  INDEX_NAME=upgrade_smoke
+  preserved_resources seed "$old_base"
   pass "old binary seeded and searchable"
 
   kill "$OLD_PID" 2>/dev/null || true
   wait "$OLD_PID" 2>/dev/null || true
   OLD_PID=""
 
-  NEW_PID="$(start_server "$NEW_BIN" "$NEW_LOG")"
+  start_server "$NEW_BIN" "$NEW_LOG"
+  NEW_PID="$STARTED_PID"
   "$WAIT_HELPER" --pid "$NEW_PID" --port auto --log-path "$NEW_LOG" >/dev/null
   local new_port
   new_port="$(extract_port_from_log "$NEW_LOG")"
@@ -376,6 +421,7 @@ main() {
   pass "new binary served the exact authenticated manifest identity"
   verify_search_hits "$new_base" "$QUERY_TOKEN" "2" "$OLD_OBJECT_IDS"
   pass "new binary preserved pre-upgrade search state"
+  preserved_resources verify "$new_base"
 
   local upgrade_write_response
   local upgrade_task_id
@@ -402,7 +448,8 @@ main() {
     NEW_PID=""
 
     OLD_LOG="$TMP_DIR/rollback-old.log"
-    OLD_PID="$(start_server "$OLD_BIN" "$OLD_LOG")"
+    start_server "$OLD_BIN" "$OLD_LOG"
+    OLD_PID="$STARTED_PID"
     "$WAIT_HELPER" --pid "$OLD_PID" --port auto --log-path "$OLD_LOG" >/dev/null
     local rollback_port
     rollback_port="$(extract_port_from_log "$OLD_LOG")"
@@ -415,6 +462,10 @@ main() {
       || fail "rollback predecessor readiness check failed"
     verify_search_hits "$rollback_base" "$QUERY_TOKEN" "2" "$OLD_OBJECT_IDS"
     verify_search_hits "$rollback_base" "$NEW_QUERY_TOKEN" "1" "$NEW_OBJECT_IDS"
+    preserved_resources verify "$rollback_base"
+    INDEX_NAME=upgrade_smoke_secondary
+    verify_search_hits "$rollback_base" "$NEW_QUERY_TOKEN" 0 '[]'
+    INDEX_NAME=upgrade_smoke
     pass "predecessor restarted on the post-write data dir and preserved both generations"
   fi
 }

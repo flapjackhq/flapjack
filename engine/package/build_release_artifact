@@ -14,7 +14,7 @@ GENERATED_DASHBOARD_PLACEHOLDER="$DASHBOARD_DIR/dist/index.html"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  package/build_release_artifact <profile> <target> <source-sha> <source-tree> <compatibility-source> <output-dir>
+  package/build_release_artifact [--published-predecessors] <profile> <target> <source-sha> <source-tree> <compatibility-source> <output-dir>
 
 Profiles:
   cloud-arm64  Build the one FJCloud production engine target.
@@ -35,6 +35,11 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "required tool is unavailable: $1"
 }
 
+PUBLISHED_PREDECESSORS=0
+if [ "${1:-}" = "--published-predecessors" ]; then
+  PUBLISHED_PREDECESSORS=1
+  shift
+fi
 if [ "$#" -ne 6 ]; then
   usage
   die "expected profile, target, source SHA, source tree, compatibility source, and output directory"
@@ -90,7 +95,11 @@ if [ -n "$BUILD_FEATURE_NAME" ]; then
   EXPECTED_CORE_FEATURES="$EXPECTED_CORE_FEATURES,$BUILD_FEATURE_NAME"
 fi
 
-if [ "$PROFILE" = "public-all" ] \
+if [ "$PUBLISHED_PREDECESSORS" = 1 ]; then
+  [ "$PROFILE" = public-all ] || die "published predecessors require public-all"
+  package_version="$(tr -d '\r' <"$ENGINE_DIR/Cargo.toml" | sed -n 's/^version = "\([^"]*\)"$/\1/p' | head -1)"
+  python3 "$SCRIPT_DIR/release_predecessors.py" --version "$package_version" --verify "$COMPATIBILITY_ARGUMENT"
+elif [ "$PROFILE" = "public-all" ] \
   && ! [ "$COMPATIBILITY_ARGUMENT" -ef "$SCRIPT_DIR/engine_compatibility.json" ]; then
   die "public-all must use the checked-in canonical compatibility source"
 fi
