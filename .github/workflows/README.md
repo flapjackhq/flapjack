@@ -84,6 +84,16 @@ The publisher opens or reuses a candidate PR. It never merges, tags, releases,
 or deploys. Merge the reviewed public PR only after **Public candidate gate** is
 green.
 
+The release workflow resolves the previous three stable published releases for
+each Linux target before packaging. Exact manifest and executable digests are
+selected automatically, independently verified by the build helper, and shared
+with the mandatory compatibility gate. `engine/tests/upgrade_smoke.sh` seeds two
+indexes with documents, settings, synonyms and rules using each old executable;
+the candidate must preserve reads/search behavior on the same directory and
+support the declared rollback after a new write. A failed populated edge blocks
+publication. The checked-in compatibility map is a local packaging baseline;
+public releases use the automatically resolved source, so it cannot go stale.
+
 ## Required GitHub Secrets
 
 Set these in the public repo settings (`flapjackhq/flapjack`):

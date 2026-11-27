@@ -112,8 +112,27 @@ jobs:
           ACKNOWLEDGED_CI_FAILURE_RUN_ID: ${{ github.event.inputs.acknowledged_ci_failure_run_id }}
         run: package/release_ci_status_preflight "${{ github.repository }}" "${{ github.sha }}" "ci.yml" "$ACKNOWLEDGED_CI_FAILURE_RUN_ID"
 
-  build:
+  release_predecessors:
+    name: Resolve previous published releases
     needs: validate_release_version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select previous three stable releases and exact manifest coordinates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: python3 engine/package/release_predecessors.py --version "$VERSION" --output "$RUNNER_TEMP/release-predecessors/engine_compatibility.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-predecessors
+          path: ${{ runner.temp }}/release-predecessors/engine_compatibility.json
+
+  build:
+    needs: [validate_release_version, release_predecessors]
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     defaults:
@@ -136,6 +155,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-predecessors
+          path: ${{ runner.temp }}/release-predecessors
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -155,16 +178,19 @@ jobs:
           tool: cross
 
       - name: Build and package exact public release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           source_tree="$(git rev-parse '${{ github.sha }}^{tree}')"
           package/build_release_artifact \
+            --published-predecessors \
             public-all \
             "${{ matrix.target }}" \
             "${{ github.sha }}" \
             "$source_tree" \
-            package/engine_compatibility.json \
+            "$RUNNER_TEMP/release-predecessors/engine_compatibility.json" \
             .
 
       - name: Upload artifact
@@ -212,6 +238,10 @@ jobs:
         with:
           name: flapjack-${{ matrix.target }}
           path: engine/compatibility-candidate
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-predecessors
+          path: ${{ runner.temp }}/release-predecessors
 
       - name: Prove every exact predecessor before publication
         working-directory: engine
@@ -232,6 +262,7 @@ jobs:
           # The helper validates canonical source equality and emits exact
           # releaseTag/manifestSha256/binarySha256 plus four recipe coordinates.
           package/release_artifact_manifest \
+            --compatibility-source "$RUNNER_TEMP/release-predecessors/engine_compatibility.json" \
             --compatibility-predecessors "$candidate_manifest" \
             >"$predecessors_file"
 

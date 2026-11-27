@@ -160,6 +160,7 @@
       "minimum_tier": "release",
       "owner_jobs": [
         ".github/workflows/release.yml#validate_release_version",
+        ".github/workflows/release.yml#release_predecessors",
         ".github/workflows/release.yml#ghcr_publish_preflight",
         ".github/workflows/release.yml#release_ci_status_preflight",
         ".github/workflows/release.yml#build",
